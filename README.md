@@ -59,11 +59,7 @@ on the task.
 ```text
 ra-pipeline/
 ├── detection/          # Joint detection models and evaluation
-├── svh/
-│   ├── binary/         # SvH abnormality classification (joint / hand / bilateral)
-│   ├── regression/     # SvH severity regression (erosion / JSN)
-│   └── uncertainty/    # Uncertainty estimation and calibration
-├── data/               # Dataset utilities and split definitions
-├── training/           # Training scripts and configuration
-├── evaluation/         # Evaluation and metrics
-└── utils/              # Shared utilities
+└── svh/
+   ├── binary/         # SvH abnormality classification (joint / hand / bilateral)
+   ├── regression/     # SvH severity regression (erosion / JSN)
+   └── regression/    # SvH severity regression (erosion / JSN)
