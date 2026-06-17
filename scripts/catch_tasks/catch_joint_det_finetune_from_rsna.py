@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Joint Detection Finetuning (DETR-style) with a ViT encoder.
+CATCH Joint Detection Finetune (DETR-style) from RSNA-trained checkpoint
 
-Selection protocol:
-- Best checkpoint selected ONLY by ES mAP@0.5:0.95.
-- When saving best, print per-type mAP@0.75 (and other mAPs).
+Requirements (per your request):
+1) LOAD RSNA detector ckpt (full model.state_dict, includes encoder)
+2) Read CATCH data from:
+   - root: /home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17
+   - split yaml: /home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17/data_split.yaml
+3) Splits usage:
+   - 80% train: used for training
+       * additionally split train internally (patient-level) into train_tr + train_es (small early-stopping set)
+   - 10% val: ONLY conformal calibration (never used for early stopping / model selection)
+   - 10% test: final evaluation
+4) When saving best ckpt (selected ONLY by early-stopping set mAP), also print:
+   - overall mAP (@0.5:0.95, @0.5, @0.75)
+   - per joint-type group metrics for: DIP / PIP / MCP / Wrist / Ulna / Radius
+     based on 17-class names:
+     ['DIP_5','DIP_4','DIP_3','DIP_2','PIP_5','PIP_4','PIP_3','PIP_2','PIP_1',
+      'MCP_5','MCP_4','MCP_3','MCP_2','MCP_1','Radius','Ulna','Wrist']
+
+Notes:
+- We do NOT read data.yaml; we read data_split.yaml only.
+- Ultralytics YOLODataset can take img_path as a .txt list of image paths.
+- Patient-level grouping: patient_id = image_name.split('_')[0]
 """
 
-import os, sys, time, random
+import os, sys, time, glob, random
 from pathlib import Path
-from argparse import Namespace, ArgumentParser
+from argparse import Namespace
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import AutoModel, AutoImageProcessor
 
-# ==== local repos (relative to this script; adjust as needed) ====
-# Tip: if you package these as a python module, you can remove sys.path hacks.
+# ==== 本地仓库路径（保持与你之前一致） ====
 sys.path.append(os.path.abspath('../../repo/yolov12/'))
 sys.path.append(os.path.abspath('../../repo/thop/'))
 sys.path.append(os.path.abspath('../../repo/detr'))
@@ -36,7 +54,49 @@ from detr import SetCriterion, PostProcess
 
 
 # =========================
-# Logging / seed
+# Config
+# =========================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.set_num_threads(2)
+
+# ---- CATCH paths ----
+CATCH_ROOT = "/home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17"
+DATA_SPLIT_YAML = "/home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17/data_split.yaml"  # IMPORTANT
+
+# ---- RSNA trained detector ckpt (best) ----
+RSNA_DET_CKPT = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema/joint_det_detr_updated_ep856_map0.7636.pt"
+
+# Train
+IMG_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 200            # finetune epochs (adjust as you like)
+SEED = 3407
+
+# Detection heads
+NUM_CLASSES = 17        # no background
+NUM_QUERIES = 100
+EOS_COEF = 0.1
+
+# Optim
+LR = 1e-4
+ENCODER_LR = 1e-5       # finetune encoder slightly smaller often helps
+WEIGHT_DECAY = 1e-4
+
+# Train strategy
+FREEZE_ENCODER = True
+ENCODER_FREEZE_EPOCHS = 5
+
+# Internal early-stopping split inside TRAIN(80%)
+# patient-level split of the *train list* into train_tr + train_es
+TRAIN_ES_RATIO = 0.05   # 5% of train patients for early-stopping
+
+# Model save
+OUTPUT_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/catch_finetune_from_rsna"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# =========================
+# Logging
 # =========================
 def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S] "), msg, flush=True)
@@ -49,7 +109,7 @@ def set_seed(seed: int):
 
 
 # =========================
-# Joint grouping
+# Joint type grouping
 # =========================
 CLASS_NAMES_17 = [
     'DIP_5', 'DIP_4', 'DIP_3', 'DIP_2',
@@ -58,6 +118,7 @@ CLASS_NAMES_17 = [
     'Radius', 'Ulna', 'Wrist'
 ]
 
+# 6 joint types you want
 JOINT_GROUPS: Dict[str, List[int]] = {
     "DIP":    [0, 1, 2, 3],
     "PIP":    [4, 5, 6, 7, 8],
@@ -67,20 +128,23 @@ JOINT_GROUPS: Dict[str, List[int]] = {
     "Wrist":  [16],
 }
 
-TYPE_ORDER = ["DIP", "PIP", "MCP", "Wrist", "Ulna", "Radius"]
-
 
 # =========================
-# Vision Encoder
+# Vision Encoder (DINOv3 student)
 # =========================
 class VisionEncoder(nn.Module):
-    def __init__(self, model_name: str, device: str):
+    """
+    - Input: batch tensor in [0,1], shape [B, 3, H, W]
+    - Internal: AutoImageProcessor preprocess (do_rescale=False)
+    - Output: patch tokens [B, P, D]
+    """
+    def __init__(self, model_name="facebook/dinov3-vitb16-pretrain-lvd1689m", device=None):
         super().__init__()
         self.processor = AutoImageProcessor.from_pretrained(model_name)
-        if hasattr(self.processor, "do_rescale"):
+        if hasattr(self.processor, 'do_rescale'):
             self.processor.do_rescale = False
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.device = device
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.encoder.to(self.device).eval()
 
         cfg = self.encoder.config
@@ -90,14 +154,15 @@ class VisionEncoder(nn.Module):
 
     @torch.no_grad()
     def _process(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,3,H,W] ∈ [0,1]
         inp = self.processor(images=list(x), return_tensors="pt")
         return inp["pixel_values"].to(self.device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x) -> torch.Tensor:
         x = x.to(self.device, dtype=torch.float32)
         pixel_values = self._process(x)
         out = self.encoder(pixel_values=pixel_values, output_hidden_states=False)
-        tokens = out.last_hidden_state
+        tokens = out.last_hidden_state  # [B, 1+R+P, D] or [B, 1+P, D]
         if self.num_register_tokens > 0:
             patches = tokens[:, 1 + self.num_register_tokens:, :]
         else:
@@ -106,10 +171,10 @@ class VisionEncoder(nn.Module):
 
 
 # =========================
-# DETR-like head
+# Decoder Head
 # =========================
 class MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 3):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3):
         super().__init__()
         layers = []
         for i in range(num_layers - 1):
@@ -118,11 +183,16 @@ class MLP(nn.Module):
         layers += [nn.Linear(hidden_dim, output_dim)]
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.mlp(x)
 
 
 class JointDEIMv2Updated(nn.Module):
+    """
+    - ViT patch tokens -> proj -> + learnable memory pos -> TransformerDecoder
+    - queries: learnable
+    - aux outputs: per-layer
+    """
     def __init__(
         self,
         encoder: VisionEncoder,
@@ -142,18 +212,15 @@ class JointDEIMv2Updated(nn.Module):
         self.input_proj = nn.Linear(D, d_model)
 
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nheads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=False,
+            d_model=d_model, nhead=nheads,
+            dim_feedforward=dim_feedforward, dropout=dropout, batch_first=False
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         self.query_embed = nn.Embedding(num_queries, d_model)
 
-        self.class_embed = nn.Linear(d_model, num_classes + 1)
-        self.bbox_embed = MLP(d_model, d_model, 4, num_layers=3)
+        self.class_embed = nn.Linear(d_model, num_classes + 1)  # + background
+        self.bbox_embed  = MLP(d_model, d_model, 4, num_layers=3)
 
         nn.init.xavier_uniform_(self.input_proj.weight)
         nn.init.constant_(self.input_proj.bias, 0.)
@@ -163,20 +230,21 @@ class JointDEIMv2Updated(nn.Module):
         self.num_queries = num_queries
         self.num_decoder_layers = num_decoder_layers
 
+        # learnable memory pos (created lazily)
         self.register_buffer("memory_pos", None, persistent=False)
 
-    def forward(self, imgs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        patches = self.encoder(imgs)  # [B,P,D]
+    def forward(self, imgs: torch.Tensor):
+        patches = self.encoder(imgs)                 # [B,P,D]
         B, P, _ = patches.shape
 
-        memory = self.input_proj(patches)  # [B,P,256]
+        memory = self.input_proj(patches)            # [B,P,256]
 
+        # learnable memory pos
         if (self.memory_pos is None) or (self.memory_pos.shape[1] != P):
             pos = torch.zeros(1, P, self.d_model, device=memory.device)
             nn.init.trunc_normal_(pos, std=0.02)
             self.memory_pos = pos
-
-        memory = (memory + self.memory_pos).transpose(0, 1)  # [P,B,256]
+        memory = (memory + self.memory_pos).transpose(0, 1)   # [P,B,256]
 
         tgt = torch.zeros(self.num_queries, B, self.d_model, device=imgs.device)
         query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)  # [Q,B,256]
@@ -184,11 +252,11 @@ class JointDEIMv2Updated(nn.Module):
         hs = []
         out = tgt
         for layer in self.decoder.layers:
-            out = layer(out + query_pos, memory)
-            hs.append(out.transpose(0, 1))
-        hs = torch.stack(hs, dim=0)  # [L,B,Q,256]
+            out = layer(out + query_pos, memory)     # [Q,B,256]
+            hs.append(out.transpose(0, 1))           # [B,Q,256]
+        hs = torch.stack(hs, dim=0)                  # [L,B,Q,256]
 
-        outputs_class = self.class_embed(hs[-1])
+        outputs_class = self.class_embed(hs[-1])     # [B,Q,C+1]
         outputs_coord = self.bbox_embed(hs[-1]).sigmoid()
 
         aux_outputs = [
@@ -200,7 +268,7 @@ class JointDEIMv2Updated(nn.Module):
 
 
 # =========================
-# Split utils
+# Utils: make internal train_es split txt
 # =========================
 def _read_list_file(p: str) -> List[str]:
     with open(p, "r") as f:
@@ -218,9 +286,16 @@ def _write_list_file(p: str, items: List[str]):
 def make_patient_level_split_from_train_txt(
     train_txt: str,
     out_dir: str,
-    seed: int,
-    es_ratio: float,
+    seed: int = 3407,
+    es_ratio: float = 0.05,
 ) -> Tuple[str, str]:
+    """
+    Given data_split.yaml's train.txt (80% patients already),
+    split its patients again into:
+      - train_tr.txt (for training)
+      - train_es.txt (small early-stopping set; NEVER touch calibration val/test)
+    patient_id = basename(img).split('_')[0]
+    """
     imgs = _read_list_file(train_txt)
     assert len(imgs) > 0, f"Empty train list: {train_txt}"
 
@@ -237,6 +312,7 @@ def make_patient_level_split_from_train_txt(
     n = len(pids)
     n_es = max(1, int(es_ratio * n))
     es_pids = set(pids[:n_es])
+    tr_pids = set(pids[n_es:])
 
     tr_imgs, es_imgs = [], []
     for pid, ps in groups.items():
@@ -259,9 +335,11 @@ def make_patient_level_split_from_train_txt(
 
 
 # =========================
-# Eval (overall + per-group map + per-group map75)
+# Eval: overall + per-group mAP
 # =========================
 def _filter_by_allowed_labels(pred: Dict, gt: Dict, allowed: set) -> Tuple[Dict, Dict]:
+    # pred: boxes/scores/labels (cpu)
+    # gt: boxes/labels (cpu)
     pl = pred["labels"]
     gl = gt["labels"]
 
@@ -269,12 +347,12 @@ def _filter_by_allowed_labels(pred: Dict, gt: Dict, allowed: set) -> Tuple[Dict,
     gm = torch.tensor([int(x.item()) in allowed for x in gl], dtype=torch.bool)
 
     pred_f = {
-        "boxes": pred["boxes"][pm],
+        "boxes":  pred["boxes"][pm],
         "scores": pred["scores"][pm],
         "labels": pred["labels"][pm],
     }
     gt_f = {
-        "boxes": gt["boxes"][gm],
+        "boxes":  gt["boxes"][gm],
         "labels": gt["labels"][gm],
     }
     return pred_f, gt_f
@@ -284,36 +362,47 @@ def _filter_by_allowed_labels(pred: Dict, gt: Dict, allowed: set) -> Tuple[Dict,
 def evaluate_detr_like_with_groups(
     model,
     loader,
-    device: str,
-    img_size: int,
+    device,
+    img_size=224,
     groups: Optional[Dict[str, List[int]]] = None,
-    tag: str = "VAL",
+    tag: str = "VAL"
 ) -> Dict[str, Dict[str, float]]:
+    """
+    Returns:
+      {
+        "ALL": {"map":..., "map50":..., "map75":...},
+        "DIP": {...}, ...
+      }
+    """
     model.eval()
     postprocessor = PostProcess()
 
     metric_all = MeanAveragePrecision(iou_type="bbox")
-    metric_groups = {g: MeanAveragePrecision(iou_type="bbox") for g in groups} if groups else {}
+    metric_groups = {}
+    if groups:
+        for g in groups:
+            metric_groups[g] = MeanAveragePrecision(iou_type="bbox")
 
     for batch in loader:
-        imgs = batch["img"].to(device, dtype=torch.float32) / 255.0
+        imgs = batch['img'].to(device, dtype=torch.float32) / 255.0
         B = imgs.size(0)
 
-        cls_ = batch["cls"]
-        bboxes = batch["bboxes"]
-        batch_idx = batch["batch_idx"]
+        cls_ = batch['cls']
+        bboxes = batch['bboxes']
+        batch_idx = batch['batch_idx']
 
         targets = []
         for i in range(B):
             labels_i = cls_[batch_idx == i].long().squeeze(-1).to(device)
-            boxes_i = bboxes[batch_idx == i].to(device)  # cxcywh normalized
+            boxes_i  = bboxes[batch_idx == i].to(device)  # cxcywh normalized
             targets.append({"labels": labels_i, "boxes": boxes_i})
 
         outputs = model(imgs)
 
-        if "ori_shape" in batch:
+        # original sizes
+        if 'ori_shape' in batch:
             orig_sizes = []
-            for s in batch["ori_shape"]:
+            for s in batch['ori_shape']:
                 if isinstance(s, (list, tuple)):
                     h, w = int(s[0]), int(s[1])
                 else:
@@ -329,12 +418,12 @@ def evaluate_detr_like_with_groups(
         for i in range(B):
             result = results[i]
             pred_i = {
-                "boxes": result["boxes"].cpu(),
-                "scores": result["scores"].cpu(),
-                "labels": result["labels"].cpu(),
+                "boxes":  result['boxes'].cpu(),
+                "scores": result['scores'].cpu(),
+                "labels": result['labels'].cpu(),
             }
 
-            cxcywh = targets[i]["boxes"]
+            cxcywh = targets[i]['boxes']
             x_c, y_c, w, h = cxcywh.unbind(-1)
             img_h, img_w = orig_target_sizes[i]
             x0 = (x_c - 0.5 * w) * img_w
@@ -342,8 +431,8 @@ def evaluate_detr_like_with_groups(
             x1 = (x_c + 0.5 * w) * img_w
             y1 = (y_c + 0.5 * h) * img_h
             gt_i = {
-                "boxes": torch.stack([x0, y0, x1, y1], dim=-1).cpu(),
-                "labels": targets[i]["labels"].cpu(),
+                "boxes":  torch.stack([x0, y0, x1, y1], dim=-1).cpu(),
+                "labels": targets[i]['labels'].cpu(),
             }
 
             preds_for_map.append(pred_i)
@@ -379,16 +468,14 @@ def evaluate_detr_like_with_groups(
                 "map75": float(r["map_75"]),
             }
 
+    # pretty print
     log(f"📊 [{tag}] mAP: @0.5:0.95={out['ALL']['map']:.4f}  @0.5={out['ALL']['map50']:.4f}  @0.75={out['ALL']['map75']:.4f}")
-
     if groups:
-        parts_map, parts_75 = [], []
-        for g in TYPE_ORDER:
+        parts = []
+        for g in ["DIP", "PIP", "MCP", "Wrist", "Ulna", "Radius"]:
             if g in out:
-                parts_map.append(f"{g}={out[g]['map']:.4f}")
-                parts_75.append(f"{g}={out[g]['map75']:.4f}")
-        log(f"    [{tag}] per-type mAP@0.5:0.95: " + " | ".join(parts_map))
-        log(f"    [{tag}] per-type mAP@0.75:    " + " | ".join(parts_75))
+                parts.append(f"{g}={out[g]['map']:.4f}")
+        log(f"    [{tag}] per-type mAP: " + " | ".join(parts))
 
     return out
 
@@ -396,36 +483,35 @@ def evaluate_detr_like_with_groups(
 # =========================
 # Data
 # =========================
-def build_dataloaders(
-    data_split_yaml: str,
-    output_dir: str,
-    seed: int,
-    train_es_ratio: float,
-    img_size: int,
-    batch_size: int,
-    workers: int,
-):
-    data = utils.check_det_dataset(data_split_yaml)
-    assert "train" in data and "val" in data and "test" in data, "split yaml must define train/val/test"
+def build_dataloaders():
+    """
+    Uses DATA_SPLIT_YAML:
+      - data['train'] : 80% patient train list
+      - data['val']   : 10% patient val list (CALIBRATION ONLY)
+      - data['test']  : 10% patient test list
+    Additionally:
+      - internally split train into train_tr + train_es for early stopping
+    """
+    data = utils.check_det_dataset(DATA_SPLIT_YAML)
 
+    assert "train" in data and "val" in data and "test" in data, "data_split.yaml must define train/val/test"
     train_txt = data["train"]
     calib_txt = data["val"]
-    test_txt = data["test"]
+    test_txt  = data["test"]
 
-    internal_dir = os.path.join(output_dir, "internal_splits")
+    # internal train split for early stopping
+    internal_dir = os.path.join(OUTPUT_DIR, "internal_splits")
     train_tr_txt, train_es_txt = make_patient_level_split_from_train_txt(
-        train_txt=train_txt,
-        out_dir=internal_dir,
-        seed=seed,
-        es_ratio=train_es_ratio,
+        train_txt=train_txt, out_dir=internal_dir, seed=SEED, es_ratio=TRAIN_ES_RATIO
     )
 
+    # ---- datasets ----
     train_dataset = build.YOLODataset(
-        task="detect",
+        task='detect',
         img_path=train_tr_txt,
         data=data,
-        imgsz=img_size,
-        batch_size=batch_size,
+        imgsz=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         augment=True,
         rect=False,
         cache=None,
@@ -441,229 +527,167 @@ def build_dataloaders(
             bgr=0.0,
             mosaic=0.0, mixup=0.0, copy_paste=0.0, copy_paste_mode="flip",
             auto_augment="randaugment", erasing=0.4,
-            crop_fraction=1.0,
+            crop_fraction=1.0
         ),
-        fraction=1.0,
+        fraction=1.0
     )
 
+    # early-stopping eval set (from train only)
     es_dataset = build.YOLODataset(
-        task="detect",
+        task='detect',
         img_path=train_es_txt,
         data=data,
-        imgsz=img_size,
-        batch_size=batch_size,
+        imgsz=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         augment=False,
         rect=False,
         cache=None,
         single_cls=False,
         stride=32,
         pad=0.0,
-        fraction=1.0,
+        fraction=1.0
     )
 
+    # calibration val (never used for model selection)
     calib_dataset = build.YOLODataset(
-        task="detect",
+        task='detect',
         img_path=calib_txt,
         data=data,
-        imgsz=img_size,
-        batch_size=batch_size,
+        imgsz=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         augment=False,
         rect=False,
         cache=None,
         single_cls=False,
         stride=32,
         pad=0.0,
-        fraction=1.0,
+        fraction=1.0
     )
 
+    # test
     test_dataset = build.YOLODataset(
-        task="detect",
+        task='detect',
         img_path=test_txt,
         data=data,
-        imgsz=img_size,
-        batch_size=batch_size,
+        imgsz=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         augment=False,
         rect=False,
         cache=None,
         single_cls=False,
         stride=32,
         pad=0.0,
-        fraction=1.0,
+        fraction=1.0
     )
 
-    train_loader = build.build_dataloader(train_dataset, batch=batch_size, workers=workers, shuffle=True)
-    es_loader = build.build_dataloader(es_dataset, batch=batch_size, workers=workers, shuffle=False)
-    calib_loader = build.build_dataloader(calib_dataset, batch=batch_size, workers=workers, shuffle=False)
-    test_loader = build.build_dataloader(test_dataset, batch=batch_size, workers=workers, shuffle=False)
+    # ---- loaders ----
+    train_loader = build.build_dataloader(train_dataset, batch=BATCH_SIZE, workers=10, shuffle=True)
+    es_loader    = build.build_dataloader(es_dataset,    batch=BATCH_SIZE, workers=10, shuffle=False)
+    calib_loader = build.build_dataloader(calib_dataset, batch=BATCH_SIZE, workers=10, shuffle=False)
+    test_loader  = build.build_dataloader(test_dataset,  batch=BATCH_SIZE, workers=10, shuffle=False)
 
-    log(f"[Data] split yaml: {data_split_yaml}")
-    log(f"[Data] train_tr list: {train_tr_txt}")
-    log(f"[Data] train_es list: {train_es_txt} (selection ONLY)")
-    log(f"[Data] calib(val) list: {calib_txt} (calibration ONLY)")
-    log(f"[Data] test list: {test_txt}")
+    log(f"[Data] Using split yaml: {DATA_SPLIT_YAML}")
+    log(f"[Data] train_tr: {train_tr_txt}")
+    log(f"[Data] train_es: {train_es_txt} (early stop ONLY)")
+    log(f"[Data] calib(val): {calib_txt} (conformal calibration ONLY)")
+    log(f"[Data] test: {test_txt}")
 
     return train_loader, es_loader, calib_loader, test_loader
-
-
-# =========================
-# Args
-# =========================
-def parse_args():
-    p = ArgumentParser()
-
-    # paths (anonymous)
-    p.add_argument("--data_split_yaml", type=str, default=os.environ.get("DATA_SPLIT_YAML", ""),
-                   help="Path to dataset split YAML that defines train/val/test.")
-    p.add_argument("--resume_ckpt", type=str, default=os.environ.get("RESUME_CKPT", ""),
-                   help="Path to a model state_dict checkpoint to resume/initialize from (e.g., RSNA-pretrained or a continued finetune ckpt).")
-    p.add_argument("--output_dir", type=str, default=os.environ.get("OUTPUT_DIR", "./outputs/joint_det"),
-                   help="Directory to save logs/checkpoints/splits.")
-
-    # training schedule
-    p.add_argument("--start_epoch", type=int, default=int(os.environ.get("START_EPOCH", "0")),
-                   help="Epoch number for logging/filenames (no effect on optimizer state).")
-    p.add_argument("--extra_epochs", type=int, default=int(os.environ.get("EXTRA_EPOCHS", "500")),
-                   help="Number of additional epochs to train.")
-    p.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "3407")))
-
-    # model/data
-    p.add_argument("--model_name", type=str, default=os.environ.get("MODEL_NAME", "facebook/dinov3-vitb16-pretrain-lvd1689m"))
-    p.add_argument("--img_size", type=int, default=int(os.environ.get("IMG_SIZE", "224")))
-    p.add_argument("--batch_size", type=int, default=int(os.environ.get("BATCH_SIZE", "360")))
-    p.add_argument("--workers", type=int, default=int(os.environ.get("WORKERS", "10")))
-
-    # detection head
-    p.add_argument("--num_classes", type=int, default=17)
-    p.add_argument("--num_queries", type=int, default=100)
-    p.add_argument("--eos_coef", type=float, default=0.1)
-
-    # optim
-    p.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
-    p.add_argument("--encoder_lr", type=float, default=float(os.environ.get("ENCODER_LR", "1e-5")))
-    p.add_argument("--weight_decay", type=float, default=float(os.environ.get("WEIGHT_DECAY", "1e-4")))
-
-    # strategy
-    p.add_argument("--freeze_encoder", action="store_true", help="Optionally freeze encoder for initial epochs.")
-    p.add_argument("--encoder_freeze_epochs", type=int, default=0)
-    p.add_argument("--train_es_ratio", type=float, default=float(os.environ.get("TRAIN_ES_RATIO", "0.05")))
-
-    args = p.parse_args()
-
-    if not args.data_split_yaml:
-        raise ValueError("Missing --data_split_yaml (or set $DATA_SPLIT_YAML).")
-    if not args.resume_ckpt:
-        raise ValueError("Missing --resume_ckpt (or set $RESUME_CKPT).")
-
-    return args
 
 
 # =========================
 # Main
 # =========================
 def main():
-    args = parse_args()
+    set_seed(SEED)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.set_num_threads(2)
+    # data
+    train_loader, es_loader, calib_loader, test_loader = build_dataloaders()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    set_seed(args.seed)
-
-    train_loader, es_loader, calib_loader, test_loader = build_dataloaders(
-        data_split_yaml=args.data_split_yaml,
-        output_dir=args.output_dir,
-        seed=args.seed,
-        train_es_ratio=args.train_es_ratio,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        workers=args.workers,
-    )
-
-    encoder = VisionEncoder(model_name=args.model_name, device=device).to(device)
+    # model
+    encoder = VisionEncoder(device=DEVICE).to(DEVICE)
     model = JointDEIMv2Updated(
         encoder=encoder,
-        num_classes=args.num_classes,
-        num_queries=args.num_queries,
+        num_classes=NUM_CLASSES,
+        num_queries=NUM_QUERIES,
         d_model=256,
         nheads=8,
         num_decoder_layers=6,
         dim_feedforward=2048,
-        dropout=0.1,
-    ).to(device)
+        dropout=0.1
+    ).to(DEVICE)
 
-    # ---- load checkpoint (RSNA-pretrained OR continued finetune) ----
-    sd = torch.load(args.resume_ckpt, map_location=device)
+    # ---- load RSNA detector ckpt (full model state_dict) ----
+    sd = torch.load(RSNA_DET_CKPT, map_location=DEVICE)
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    log(f"[CKPT] Loaded state_dict from: {args.resume_ckpt}")
+    log(f"[CKPT] Loaded RSNA detector ckpt: {RSNA_DET_CKPT}")
     if missing:
         log(f"[CKPT] missing_keys: {len(missing)} (first 10) {missing[:10]}")
     if unexpected:
         log(f"[CKPT] unexpected_keys: {len(unexpected)} (first 10) {unexpected[:10]}")
 
+    # criterion
     matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=2)
-    losses = ["labels", "boxes", "cardinality"]
+    losses = ['labels', 'boxes', 'cardinality']
 
-    weight_dict = {"loss_ce": 2, "loss_bbox": 5, "loss_giou": 2}
+    weight_dict = {'loss_ce': 2, 'loss_bbox': 5, 'loss_giou': 2}
     aux_weight_dict = {}
     for i in range(6 - 1):
-        aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+        aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
     weight_dict.update(aux_weight_dict)
 
     criterion = SetCriterion(
-        num_classes=args.num_classes,
+        num_classes=NUM_CLASSES,
         matcher=matcher,
         weight_dict=weight_dict,
-        eos_coef=args.eos_coef,
-        losses=losses,
-    ).to(device)
+        eos_coef=EOS_COEF,
+        losses=losses
+    ).to(DEVICE)
 
+    # optim (encoder vs other)
     enc_params = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("encoder.")]
     other_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("encoder.")]
 
     optimizer = torch.optim.AdamW(
-        [{"params": other_params, "lr": args.lr},
-         {"params": enc_params, "lr": args.encoder_lr}],
-        weight_decay=args.weight_decay,
+        [{"params": other_params, "lr": LR},
+         {"params": enc_params,   "lr": ENCODER_LR}],
+        weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.extra_epochs)
 
-    start_epoch = int(args.start_epoch)
-    total_epochs = start_epoch + int(args.extra_epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    # baseline ES evaluation
-    log("Initial evaluation on ES to set baseline best:")
-    es0 = evaluate_detr_like_with_groups(
-        model, es_loader, device, img_size=args.img_size, groups=JOINT_GROUPS, tag=f"ES(init@ep{start_epoch})"
-    )
-    best_es_map = es0["ALL"]["map"]
-    best_epoch = start_epoch
-    log(f"[Init] best_es_map={best_es_map:.4f} at epoch={best_epoch}")
+    best_es_map = -1.0
 
-    for epoch in range(start_epoch + 1, total_epochs + 1):
+    # ---- initial eval (optional) ----
+    log("Initial evaluation on early-stop set (train_es):")
+    _ = evaluate_detr_like_with_groups(model, es_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag="ES(init)")
+
+    for epoch in range(1, EPOCHS + 1):
         model.train()
         t0 = time.time()
         running_loss, n_samples = 0.0, 0
 
-        if args.freeze_encoder and (epoch <= start_epoch + args.encoder_freeze_epochs):
+        # freeze encoder for first few epochs
+        if FREEZE_ENCODER and epoch <= ENCODER_FREEZE_EPOCHS:
             for p in model.encoder.parameters():
                 p.requires_grad = False
-        elif args.freeze_encoder and (epoch == start_epoch + args.encoder_freeze_epochs + 1):
+        elif FREEZE_ENCODER and epoch == ENCODER_FREEZE_EPOCHS + 1:
             log(f"🔓 Unfreeze encoder from epoch {epoch}")
             for p in model.encoder.parameters():
                 p.requires_grad = True
 
         for batch in train_loader:
-            imgs = batch["img"].to(device, dtype=torch.float32) / 255.0
+            imgs = batch['img'].to(DEVICE, dtype=torch.float32) / 255.0
             B = imgs.size(0)
 
-            cls_ = batch["cls"]
-            bboxes = batch["bboxes"]
-            batch_idx = batch["batch_idx"]
+            cls_ = batch['cls']
+            bboxes = batch['bboxes']
+            batch_idx = batch['batch_idx']
 
             targets = [
                 {
-                    "labels": cls_[batch_idx == i].long().squeeze(-1).to(device),
-                    "boxes": bboxes[batch_idx == i].to(device),
+                    'labels': cls_[batch_idx == i].long().squeeze(-1).to(DEVICE),
+                    'boxes':  bboxes[batch_idx == i].to(DEVICE)
                 }
                 for i in range(B)
             ]
@@ -671,54 +695,48 @@ def main():
             outputs = model(imgs)
             loss_dict = criterion(outputs, targets)
             weight = criterion.weight_dict
-            loss_sum = sum(loss_dict[k] * weight[k] for k in loss_dict.keys() if k in weight)
+            losses_sum = sum(loss_dict[k] * weight[k] for k in loss_dict.keys() if k in weight)
 
             optimizer.zero_grad(set_to_none=True)
-            loss_sum.backward()
+            losses_sum.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
             optimizer.step()
 
-            running_loss += float(loss_sum.item()) * B
+            running_loss += float(losses_sum.item()) * B
             n_samples += B
 
         scheduler.step()
 
         train_loss = running_loss / max(1, n_samples)
-        log(f"Epoch {epoch}/{total_epochs} | TrainLoss={train_loss:.4f} | time={time.time()-t0:.1f}s")
+        log(f"Epoch {epoch:03d}/{EPOCHS} | TrainLoss={train_loss:.4f} | time={time.time()-t0:.1f}s")
 
-        # ES eval (selection only)
+        # ---- early-stop eval (ONLY for selecting best) ----
         es_res = evaluate_detr_like_with_groups(
-            model, es_loader, device, img_size=args.img_size, groups=JOINT_GROUPS, tag=f"ES(ep{epoch})"
+            model, es_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"ES(ep{epoch})"
         )
         es_map = es_res["ALL"]["map"]
 
         if es_map > best_es_map:
             best_es_map = es_map
-            best_epoch = epoch
-            save_path = os.path.join(args.output_dir, f"joint_det_best_ep{epoch}_esmap{best_es_map:.4f}.pt")
+            save_path = os.path.join(OUTPUT_DIR, f"catch_det_from_rsna_best_ep{epoch}_esmap{best_es_map:.4f}.pt")
             torch.save(model.state_dict(), save_path)
             log(f"✅ Saved BEST (by ES mAP) to: {save_path}")
 
-            log("---- Evaluate on CALIB (val, calibration-only split) ----")
+            # ---- when saving best: print group metrics on CALIB and TEST too ----
+            log("---- Evaluate on CALIB (val, conformal calibration set) ----")
             _ = evaluate_detr_like_with_groups(
-                model, calib_loader, device, img_size=args.img_size, groups=JOINT_GROUPS, tag=f"CALIB(best@ep{epoch})"
+                model, calib_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"CALIB(best@ep{epoch})"
             )
 
-            log("---- Evaluate on TEST (final split) ----")
+            log("---- Evaluate on TEST (final set) ----")
             _ = evaluate_detr_like_with_groups(
-                model, test_loader, device, img_size=args.img_size, groups=JOINT_GROUPS, tag=f"TEST(best@ep{epoch})"
+                model, test_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"TEST(best@ep{epoch})"
             )
 
     log("Training finished.")
-    log(f"Best ES mAP = {best_es_map:.4f} at epoch={best_epoch}")
+    log(f"Best ES mAP = {best_es_map:.4f}")
 
 
 if __name__ == "__main__":
     main()
 
-# Example:
-# python3 catch_joint_detection.py \
-#   --data_split_yaml /path/to/data_split.yaml \
-#   --resume_ckpt /path/to/rsna_or_resume_ckpt.pt \
-#   --output_dir ./outputs/joint_det \
-#   --start_epoch 0 --extra_epochs 500
