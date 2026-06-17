@@ -10,16 +10,14 @@ The scripts are research scripts with hardcoded dataset and checkpoint paths fro
 
 ## Requirements
 
-The code was developed and run in a conda environment with Python 3.11.13 and CUDA-enabled PyTorch. The main Python dependencies are:
+The code was developed and run in the conda environment exported in `environment.yml`. Key components of the original environment include:
 
-- `torch`, `torchvision`
-- `transformers`, `timm`
-- `numpy`, `pandas`, `scipy`, `scikit-learn`, `Pillow`
-- `tqdm`
-- `torchmetrics`
-- `ultralytics`
-- `open_clip_torch` / `open_clip`
-- `opencv-python` and standard image-processing utilities as needed by the detection and segmentation scripts
+- Python 3.11.13
+- PyTorch 2.6.0 with CUDA 12.6
+- torchvision 0.21.0
+- pandas 2.3.0, scipy 1.15.2, scikit-learn 1.7.0, Pillow 11.2.1
+- OpenCV 4.11.0 and albumentations 2.0.8
+- `transformers`, `timm`, `torchmetrics`, `pycocotools`, and related imaging utilities
 
 Several detection, segmentation, CLIP, and optimizer dependencies were imported from local source checkouts in the original environment rather than installed as standard site-packages. The relevant scripts append these local repositories to `sys.path`, for example:
 
@@ -34,11 +32,13 @@ Several detection, segmentation, CLIP, and optimizer dependencies were imported 
 
 The pretraining script also exposes an optional Muon optimizer path. Muon is not required for the final reported model; if Muon is unavailable, the script falls back to Adam-based optimization.
 
-To save a minimal conda environment specification from the original environment, run:
+To recreate the exported environment, use:
 
 ```bash
-conda env export --from-history > environment.yml
+conda env create -f environment.yml
 ```
+
+The exported file records the original environment name (`ms127`) and absolute server prefix. If recreating the environment on another system, remove or edit the `prefix:` line in `environment.yml` before running the command above. Local source checkouts such as `yolov12`, `detr`, `open_clip`, and optional `Muon` must still be placed at the paths expected by the scripts or the corresponding `sys.path.append(...)` entries should be updated.
 
 ## Repository Layout
 
