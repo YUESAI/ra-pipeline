@@ -618,17 +618,17 @@ def train(args):
         cls_loss_weight=args.cls_loss_weight, normalize_per_expert=True
     ).to(device)
 
-        # =========================
-    # (可选) 从指定 checkpoint 加载继续训练
     # =========================
-    start_epoch = 0
+    # Optional resume from a specified checkpoint
+    # =========================
+    start_epoch = 1
     if getattr(args, "resume_ckpt", None):
         ckpt_path = Path(args.resume_ckpt)
         if ckpt_path.exists():
             print(f"[RESUME] Loading checkpoint: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location="cpu")
 
-            # 学生编码器
+            # Student encoder
             if "student_state" in ckpt:
                 model.encoder.load_state_dict(ckpt["student_state"], strict=True)
                 print("  ✓ loaded student_state")
@@ -662,7 +662,7 @@ def train(args):
             else:
                 optimizer_state = None
 
-            # epoch
+            # Resume at the next epoch stored in the checkpoint.
             start_epoch = ckpt.get("epoch", 0) + 1
             print(f"  → Resume from epoch {start_epoch}")
 
@@ -707,7 +707,7 @@ def train(args):
     if args.use_muon and not _USE_MUON:
         print("[WARN] Muon not available, fallback to Adam.")
 
-            # 恢复 optimizer 状态
+    # Restore optimizer state if available.
     if optimizer_state is not None:
         try:
             optimizer.load_state_dict(optimizer_state)
@@ -778,7 +778,7 @@ def build_argparser():
     p = argparse.ArgumentParser(description="HandX whole-image masked latent alignment pretraining (multi-expert, EMA, edge-aware masking) — fixed")
     # data
     p.add_argument("--data_roots", type=str, nargs="+", required=True, help="one or more data roots")
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--num_workers", type=int, default=8)
     # student
     p.add_argument("--dinov3_path", type=str, default=None, help="local DINOv3 directory (preferred if provided)")
@@ -795,22 +795,22 @@ def build_argparser():
     p.add_argument("--reg_mlp_ratio", type=float, default=4.0)
     p.add_argument("--reg_drop_path", type=float, default=0.1)
     # train
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--enc_lr", type=float, default=3e-5, help="LR for encoder")
     p.add_argument("--head_lr", type=float, default=1e-4, help="LR for regressor + proj-heads")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--mask_ratio", type=float, default=0.5)
-    p.add_argument("--mask_type", type=str, default="random", choices=["random","edge"], help="masking strategy")
-    p.add_argument("--mask_edge_alpha", type=float, default=0.5, help="edge-aware vs uniform mix (0=all edge,1=all uniform)")
+    p.add_argument("--mask_type", type=str, default="edge", choices=["random","edge"], help="masking strategy")
+    p.add_argument("--mask_edge_alpha", type=float, default=0.8, help="edge-aware vs uniform mix (0=all edge,1=all uniform)")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--freeze_epochs", type=int, default=0, help="freeze encoder for first N epochs")
     # EMA / losses
-    p.add_argument("--use_ema", action="store_true", help="enable EMA consistency")
+    p.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True, help="enable EMA consistency")
     p.add_argument("--ema_m", type=float, default=0.996, help="EMA momentum")
-    p.add_argument("--ema_loss_weight", type=float, default=0.0, help="EMA consistency loss weight")
-    p.add_argument("--cls_loss_weight", type=float, default=0.0, help="CLS distillation weight per expert (pre-normalization)")
+    p.add_argument("--ema_loss_weight", type=float, default=0.01, help="EMA consistency loss weight")
+    p.add_argument("--cls_loss_weight", type=float, default=0.01, help="CLS distillation weight per expert (pre-normalization)")
     # optimizer
-    p.add_argument("--use_muon", action="store_true", help="use MuonWithAuxAdam if available")
+    p.add_argument("--use_muon", action=argparse.BooleanOptionalAction, default=True, help="use MuonWithAuxAdam if available")
     # save
     p.add_argument("--save_dir", type=str, default="./checkpoints")
     p.add_argument("--save_every", type=int, default=10)

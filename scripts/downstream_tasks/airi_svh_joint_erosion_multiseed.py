@@ -279,9 +279,14 @@ def run_one_seed(seed: int):
 
     df_all  = pd.read_csv(TRAIN_CSV)
     df_tr   = df_all.iloc[split_data["train"]].reset_index(drop=True)
+    val_key = "val" if "val" in split_data else "valid"
+    if val_key not in split_data:
+        raise KeyError("SPLIT_JSON must contain a validation split under 'val' or 'valid'.")
+    df_val  = df_all.iloc[split_data[val_key]].reset_index(drop=True)
     df_test = df_all.iloc[split_data["test"]].reset_index(drop=True)
 
     train_ds = JointDataset(df_tr, IMG_ROOT, train_tf)
+    val_ds   = JointDataset(df_val, IMG_ROOT, eval_tf)
     test_ds  = JointDataset(df_test, IMG_ROOT, eval_tf)
 
     g = torch.Generator()
@@ -305,8 +310,16 @@ def run_one_seed(seed: int):
         pin_memory=True,
         persistent_workers=True,
     )
+    val_ld = DataLoader(
+        val_ds,
+        batch_size=BATCH,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
-    log(f"Seed {seed} | Train samples: {len(train_ds)} | Test samples: {len(test_ds)}")
+    log(f"Seed {seed} | Train samples: {len(train_ds)} | Val samples: {len(val_ds)} | Test samples: {len(test_ds)}")
 
     init_mode = "random" if RANDOM_INIT else "pretrained"
     encoder = VisionEncoder(device=DEVICE, init_mode=init_mode).to(DEVICE)
@@ -329,11 +342,12 @@ def run_one_seed(seed: int):
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     loss_e = MaskedRegressionLoss()
 
-    best_test_pcc = -1e9
-    best_metrics = None
+    best_val_pcc = -1e9
+    best_val_metrics = None
     best_epoch = -1
+    best_path = None
 
-    for ep in range(EPOCHS + 1):
+    for ep in range(1, EPOCHS + 1):
         t0 = time.time()
 
         train_loss = train_epoch(model, train_ld, optimizer, loss_e)
@@ -342,35 +356,44 @@ def run_one_seed(seed: int):
         tr_e = train_metrics["erosion"]
         log_split_metrics(f"Train (seed={seed}, epoch={ep})", tr_e)
 
-        test_metrics = eval_loader(model, test_ld)
-        te_e = test_metrics["erosion"]
-        log_split_metrics(f"Test (seed={seed}, epoch={ep})", te_e)
+        val_metrics = eval_loader(model, val_ld)
+        va_e = val_metrics["erosion"]
+        log_split_metrics(f"Val (seed={seed}, epoch={ep})", va_e)
 
-        test_pcc = te_e["pcc"]
+        val_pcc = va_e["pcc"]
 
         log(
             f"Seed {seed} | Epoch {ep:03d}/{EPOCHS} | "
-            f"TrainLoss={train_loss:.4f} | Test PCC={test_pcc:.4f} | "
+            f"TrainLoss={train_loss:.4f} | Val PCC={val_pcc:.4f} | "
             f"Time {time.time()-t0:.1f}s"
         )
 
-        if test_pcc > best_test_pcc:
-            best_test_pcc = test_pcc
-            best_metrics = te_e.copy()
+        if val_pcc > best_val_pcc:
+            best_val_pcc = val_pcc
+            best_val_metrics = va_e.copy()
             best_epoch = ep
 
             save_path = os.path.join(
                 MODEL_SAVE_DIR,
-                f"seed{seed}_airi_svh_joint_erosion_ep{ep}_pcc{best_test_pcc:.4f}.pt"
+                f"seed{seed}_airi_svh_joint_erosion_ep{ep}_valpcc{best_val_pcc:.4f}.pt"
             )
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved best seed-{seed} model to {save_path}")
+            best_path = save_path
+            log(f"Saved best-by-val seed-{seed} model to {save_path}")
 
-    log(f"Finished seed {seed} | Best epoch={best_epoch} | Best metrics={best_metrics}")
+    if best_path is None:
+        raise RuntimeError(f"No checkpoint was selected for seed {seed}.")
+    model.load_state_dict(torch.load(best_path, map_location=DEVICE))
+    test_metrics = eval_loader(model, test_ld)
+    test_e = test_metrics["erosion"]
+    log_split_metrics(f"Test (seed={seed}, best_epoch={best_epoch})", test_e)
+
+    log(f"Finished seed {seed} | Best epoch={best_epoch} | Best val metrics={best_val_metrics} | Test metrics={test_e}")
     return {
         "seed": seed,
         "best_epoch": best_epoch,
-        "best_metrics": best_metrics,
+        "best_val_metrics": best_val_metrics,
+        "test_metrics": test_e,
     }
 
 # =========================
@@ -381,7 +404,7 @@ def summarize_results(results):
     summary = {}
 
     for m in metric_names:
-        vals = [r["best_metrics"][m] for r in results]
+        vals = [r["test_metrics"][m] for r in results]
         summary[m] = {
             "mean": float(np.mean(vals)),
             "std": float(np.std(vals)),
@@ -389,7 +412,7 @@ def summarize_results(results):
         }
 
     log("=" * 80)
-    log("Multi-seed summary (best test metric per seed)")
+    log("Multi-seed summary (test metrics from validation-selected checkpoints)")
     log(
         "Erosion: "
         f"RMSE={summary['rmse']['mean']:.4f}±{summary['rmse']['std']:.4f}, "

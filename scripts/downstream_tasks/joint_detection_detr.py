@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Joint Detection with DINOv3 FM + DETR-style Decoder (optimized version)
-- 真正可训练的 ViT encoder（不再一直 eval）
-- 用纯 tensor 的预处理，去掉 list(images) 的慢路径
-- 固定可学习 2D pos，并支持插值
-- encoder 和其余部分分组学习率
-- 可选 AMP
-- eval 阶段加 NMS，让观感/指标更接近 YOLO 系
-- imgsz 保持 224
+- Trainable ViT encoder instead of keeping the backbone in eval mode.
+- Tensor-only preprocessing avoids the slow list(images) path.
+- Fixed learnable 2D positional embeddings with interpolation support.
+- Separate learning-rate groups for the encoder and the remaining modules.
+- Optional AMP.
+- Evaluation uses NMS for YOLO-like qualitative behavior.
+- Image size is kept at 224.
 """
 
 import os, sys, time
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor
 from torchvision.ops import batched_nms
 
-# ==== 本地仓库路径（保持和你原来一致） ====
+# Local repository paths.
 sys.path.append(os.path.abspath('../../repo/yolov12/'))
 sys.path.append(os.path.abspath('../../repo/thop/'))
 sys.path.append(os.path.abspath('../../repo/detr'))
@@ -44,30 +44,30 @@ from detr import SetCriterion, PostProcess
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
-# 预训练权重
+# Pretrained foundation checkpoint.
 CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
 # Joint detection dataset (ultralytics)
-IMG_SIZE = 224                # 保持不变
+IMG_SIZE = 224
 # BATCH_SIZE = 128
 BATCH_SIZE = 512
 EPOCHS = 1000
 
 # Detection heads
-NUM_CLASSES = 17              # 不含背景
+NUM_CLASSES = 17              # Foreground classes only; background is handled by DETR.
 NUM_QUERIES = 50
 EOS_COEF = 0.1
 
 # Optim
-LR = 1e-4                     # decoder / heads
-ENCODER_LR = 1e-5             # encoder 更小一点
+LR = 1e-4                     # Decoder / heads.
+ENCODER_LR = 1e-5             # Smaller LR for the encoder.
 WEIGHT_DECAY = 1e-5
 # WEIGHT_DECAY = 1e-4
 
-# 训练策略
-FREEZE_ENCODER = True         # 前几轮先冻住 encoder
-ENCODER_FREEZE_EPOCHS = 1000    # 前 10 epoch 不动 encoder
-USE_AMP = True                # 建议开 AMP
+# Training strategy for the paper setting: fine-tune the encoder with a smaller LR.
+FREEZE_ENCODER = False
+ENCODER_FREEZE_EPOCHS = 0
+USE_AMP = True
 
 # Model save
 OUTPUT_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema"
@@ -83,14 +83,14 @@ def log(msg: str):
 # =========================
 class VisionEncoder(nn.Module):
     """
-    - 输入：batch tensor in [0,1], shape [B, 3, H, W]
-    - 内部：只做 normalize，不再走 list(images)
-    - 输出：patch tokens [B, P, D]
+    - Input: batch tensor in [0,1], shape [B, 3, H, W].
+    - Internal preprocessing only normalizes tensors and avoids list(images).
+    - Output: patch tokens [B, P, D].
     """
     def __init__(self, model_name="facebook/dinov3-vitb16-pretrain-lvd1689m", device=None):
         super().__init__()
         self.processor = AutoImageProcessor.from_pretrained(model_name)
-        # 我们自己 /255，所以这里不需要再 rescale
+        # Inputs are already scaled by /255, so no additional rescaling is needed.
         if hasattr(self.processor, "do_rescale"):
             self.processor.do_rescale = False
 
@@ -98,7 +98,7 @@ class VisionEncoder(nn.Module):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.encoder.to(self.device)
 
-        # 把 mean/std 缓存成 buffer，走纯 tensor
+        # Cache mean/std as buffers for tensor-only normalization.
         image_mean = torch.tensor(self.processor.image_mean).view(1, 3, 1, 1)
         image_std = torch.tensor(self.processor.image_std).view(1, 3, 1, 1)
         self.register_buffer("image_mean", image_mean, persistent=False)
@@ -120,7 +120,7 @@ class VisionEncoder(nn.Module):
     def forward(self, x) -> torch.Tensor:
         x = x.to(self.device, dtype=torch.float32)
         pixel_values = self._process(x)
-        # 非冻结阶段这里会被 .train() 掉
+        # This is switched by .train() during non-frozen training.
         out = self.encoder(pixel_values=pixel_values, output_hidden_states=False)
         tokens = out.last_hidden_state  # [B, 1+R+P, D] or [B, 1+P, D]
         if self.num_register_tokens > 0:
@@ -130,7 +130,7 @@ class VisionEncoder(nn.Module):
         return patches
 
     def train(self, mode: bool = True):
-        # 覆盖一下，确保内部 encoder 也切换
+        # Ensure the wrapped encoder is switched as well.
         super().train(mode)
         self.encoder.train(mode)
         return self
@@ -190,7 +190,8 @@ class JointDETRUpdated(nn.Module):
     - ViT patch tokens → proj → +2D pos → TransformerDecoder
     - queries: learnable
     - aux: per-layer outputs
-    - 这里固定了一个 224×224 / 16×16 patch 的长度 14×14=196，如果 encoder 输出别的长度会插值
+    - The default length is fixed for 224x224 / 16x16 patches (14x14=196);
+      positional embeddings are interpolated if the encoder output length differs.
     """
     def __init__(
         self,
@@ -227,7 +228,7 @@ class JointDETRUpdated(nn.Module):
         self.num_queries = num_queries
         self.num_decoder_layers = num_decoder_layers
 
-        # 固定长度的可学习 2D pos
+        # Fixed-length learnable 2D positional embedding.
         self.memory_pos = nn.Parameter(torch.zeros(1, num_patches, d_model))
         nn.init.trunc_normal_(self.memory_pos, std=0.02)
 
@@ -244,7 +245,7 @@ class JointDETRUpdated(nn.Module):
         # 2) proj
         memory = self.input_proj(patches)            # [B,P,256]
 
-        # 3) 2D pos for memory，若 P 变化则插值
+        # 3) 2D positional embedding for memory; interpolate if P changes.
         if P != self.memory_pos.shape[1]:
             mem_pos = F.interpolate(
                 self.memory_pos.transpose(1, 2),     # [1,256,P0]
@@ -261,7 +262,7 @@ class JointDETRUpdated(nn.Module):
         tgt = torch.zeros(self.num_queries, B, self.d_model, device=imgs.device)
         query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)  # [Q,B,256]
 
-        # 5) decoder (手动拿中间层输出 → aux loss)
+        # 5) Decoder outputs intermediate layers for auxiliary losses.
         hs = []
         out = tgt
         for layer in self.decoder.layers:
@@ -338,7 +339,7 @@ def evaluate_detr_like(
 
         outputs = model(imgs)
 
-        # 原图尺寸（ultralytics 通常会给 ori_shape，是 (h, w)）
+        # Original image size. Ultralytics usually provides ori_shape as (h, w).
         if "ori_shape" in batch:
             orig_sizes = []
             for s in batch["ori_shape"]:
@@ -352,7 +353,7 @@ def evaluate_detr_like(
             orig_target_sizes = torch.tensor([[img_size, img_size]] * B, device=device, dtype=torch.long)
 
         results = postprocessor(outputs, orig_target_sizes)
-        # NMS 一下，和 YOLO 观感更像
+        # Apply NMS for YOLO-like qualitative output.
         results = nms_postprocess(results, iou_th=nms_iou)
 
         preds_for_map, gts_for_map = [], []
@@ -476,7 +477,7 @@ def main():
     best_map = 0.3
 
     # criterion
-    matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=3)  # giou 稍微拉高
+    matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=3)
     losses = ["labels", "boxes", "cardinality"]
 
     weight_dict = {"loss_ce": 2.0, "loss_bbox": 5.0, "loss_giou": 2.0}
@@ -493,7 +494,7 @@ def main():
         losses=losses,
     ).to(DEVICE)
 
-    # 参数分组：真正的 ViT backbone 用更小 lr
+    # Parameter groups: use a smaller LR for the ViT backbone.
     backbone_prefix = "encoder.encoder"
 
     enc_params, other_params = [], []
@@ -525,7 +526,7 @@ def main():
         t0 = time.time()
         running_loss, n_samples = 0.0, 0
 
-        # 冻住/解冻 encoder（注意要切 train(False/True)）
+        # Optional freeze/unfreeze schedule for ablation runs.
         if FREEZE_ENCODER and epoch <= ENCODER_FREEZE_EPOCHS:
             for p in model.encoder.parameters():
                 p.requires_grad = False
@@ -604,4 +605,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

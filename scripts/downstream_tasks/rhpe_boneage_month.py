@@ -41,32 +41,31 @@ except Exception:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
-# —— Foundation Model ckpt ——（优先用 ema_state）
+# Foundation model checkpoint. Prefer ema_state for the paper setting.
 CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
 DINO_LOCAL_PATH = "/home/UWO/ylong66/data/RA/LLM/hf_model/dinov3-vitb16"
-# LOAD_EMA = True
-LOAD_EMA = False
+LOAD_EMA = True
 
-# —— RHPE 数据 ——（按你提供的路径）
+# RHPE data paths.
 TRAIN_IMG_DIR = "/home/UWO/ylong66/data/RA/RA/external_data/RHPE/RHPE_train"
 VAL_IMG_DIR   = "/home/UWO/ylong66/data/RA/RA/external_data/RHPE/RHPE_val"
 TRAIN_CSV     = "/home/UWO/ylong66/data/RA/RA/external_data/RHPE/RHPE_Annotations/RHPE_Boneage_train.csv"
 VAL_CSV       = "/home/UWO/ylong66/data/RA/RA/external_data/RHPE/RHPE_Annotations/RHPE_Boneage_val.csv"
 
-# —— 训练超参 ——（与 RSNA 代码保持一致的风格）
+# Training hyperparameters.
 IMG_SIZE = 224
 BATCH    = 64
 EPOCHS   = 100
 LR       = 1e-5
 WEIGHT_DECAY = 1e-5
-USE_META = True            # 使用性别（Male）元信息
-FREEZE_ENCODER = True      # 是否只训头
-USE_AMP = True             # 混合精度
-USE_MUON = True            # 若可用则使用 Muon
+USE_META = True            # Use the sex covariate.
+FREEZE_ENCODER = True      # Train only the task head when True.
+USE_AMP = True             # Mixed precision.
+USE_MUON = True            # Use Muon if available.
 NUM_WORKERS = 6
 
-# —— 表征选择：'cls' | 'patch_mean' | 'cls_patch_cat' ——
+# Representation mode: 'cls' | 'patch_mean' | 'cls_patch_cat'.
 TOKEN_MODE = "cls"
 
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema"
@@ -104,11 +103,11 @@ val_tf = T.Compose([
 # =========================
 class RHPEDataset(Dataset):
     """
-    读取 RHPE 标注（CSV 列为 ID, Male, Boneage, Chronological）
-      - ID: 与图像文件名关联（支持 .png/.jpg/.jpeg，递归检索）
-      - Male: True/False, 也兼容 0/1、M/F 字样
-      - Boneage: 月份（统一 /240 → [0,1]）
-      - Chronological: 可不使用（此处仅保留以便将来扩展）
+    Read RHPE annotations with columns ID, Male, Boneage, and Chronological.
+      - ID: linked to image filenames; supports recursive .png/.jpg/.jpeg search.
+      - Male: True/False, also compatible with 0/1 and M/F values.
+      - Boneage: months, normalized by /240 to [0,1].
+      - Chronological: retained for future extensions but not used here.
     """
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
 
@@ -117,15 +116,14 @@ class RHPEDataset(Dataset):
         self.transform = transform
 
         df = pd.read_csv(csv_path)
-        # 标准化列名
+        # Standardize column names.
         def norm(c: str) -> str:
             c = c.strip().lower().replace("_", " ").replace("（", "(").replace("）", ")")
             c = " ".join(c.split())
             return c
         df.rename(columns={c: norm(c) for c in df.columns}, inplace=True)
 
-        # 期望字段
-        # 示例：ID,Male,Boneage,Chronological
+        # Expected fields, for example: ID,Male,Boneage,Chronological.
         name_map = {}
         for c in df.columns:
             if c in ["id"]:
@@ -140,12 +138,12 @@ class RHPEDataset(Dataset):
 
         for req in ["id", "male", "boneage"]:
             if req not in df.columns:
-                raise RuntimeError(f"CSV 缺少必要列: '{req}'。检测到列: {list(df.columns)}")
+                raise RuntimeError(f"CSV is missing required column '{req}'. Detected columns: {list(df.columns)}")
 
-        # 处理 id -> 去扩展名，仅保留基名
+        # Convert IDs to extension-free basenames.
         def to_id_str(v):
             s = str(v).strip()
-            # 例如 "123.png" -> "123"
+            # Example: "123.png" -> "123".
             for ext in self.IMG_EXTS:
                 if s.endswith(ext):
                     s = s[: -len(ext)]
@@ -158,7 +156,7 @@ class RHPEDataset(Dataset):
             if pd.isna(v):
                 return 0.0
             if isinstance(v, (int, float, np.number)):
-                # 兼容 0/1
+                # Numeric 0/1 fallback.
                 return float(v)
             s = str(v).strip().lower()
             if s in ["1", "true", "t", "yes", "y", "male", "m"]:
@@ -168,13 +166,13 @@ class RHPEDataset(Dataset):
             return 1.0 if s.startswith("t") or s.startswith("m") else 0.0
 
         def to_age01(v):
-            # 月份到 [0,1]；以 240 月（20 岁）为上限
+            # Months to [0,1], using 240 months (20 years) as the upper bound.
             return float(v) / 240.0
 
         df["male01"] = df["male"].apply(to_male01)
         df["boneage01"] = df["boneage"].apply(to_age01)
 
-        # 可选保留真实年龄
+        # Optionally keep chronological age for future use.
         if "chronological" in df.columns:
             df["chron01"] = df["chronological"].apply(lambda x: float(x) / 240.0)
         else:
@@ -188,7 +186,7 @@ class RHPEDataset(Dataset):
             if "chronological" in df.columns:
                 head_cols += ["chronological", "chron01"]
             head = self.df.head(5)[head_cols]
-            log(f"[RHPEDataset] 解析列完成。样例：\n{head}")
+            log(f"[RHPEDataset] Parsed columns successfully. Sample:\n{head}")
 
     def __len__(self):
         return len(self.df)
@@ -204,16 +202,16 @@ class RHPEDataset(Dataset):
                     self._image_cache[stem] = os.path.join(root, fn)
 
     def _resolve_image_path(self, id_str: str) -> Optional[str]:
-        # 先尝试最直接的拼接
+        # Try the direct path first.
         for ext in self.IMG_EXTS:
             p = os.path.join(self.image_dir, id_str + ext)
             if os.path.exists(p):
                 return p
-        # 全局索引
+        # Build a global filename index.
         self._build_index_if_needed()
         if id_str in self._image_cache:
             return self._image_cache[id_str]
-        # 再尝试零填充（例如 1 -> 0001），做 2~6 位补零尝试
+        # Then try zero-padded variants, e.g. 1 -> 0001, for widths 2 to 6.
         for width in range(2, 7):
             key = str(id_str).zfill(width)
             if key in self._image_cache:
@@ -224,7 +222,7 @@ class RHPEDataset(Dataset):
         row = self.df.iloc[idx]
         img_path = self._resolve_image_path(str(row["id_str"]))
         if img_path is None:
-            raise FileNotFoundError(f"找不到图像: id='{row['id_str']}' 于目录 {self.image_dir}")
+            raise FileNotFoundError(f"Image not found for id='{row['id_str']}' under {self.image_dir}")
 
         image = Image.open(img_path).convert("RGB")
         if self.transform:
@@ -236,7 +234,7 @@ class RHPEDataset(Dataset):
         return image, bone_age, is_male
 
 # =========================
-# Vision Encoder（与 RSNA 版本一致）
+# Vision encoder, consistent with the RSNA version.
 # =========================
 try:
     from transformers import AutoFeatureExtractor as _AutoFE
@@ -245,10 +243,10 @@ except Exception:
 
 class VisionEncoder(nn.Module):
     """
-    - 强制本地加载（local_files_only=True）
-    - 若无 preprocessor_config.json，回退 AutoFeatureExtractor
-    - 输入是 [0,1]；processor 在 CPU 上处理，再搬到 encoder 设备
-    - 去除 register tokens，仅保留 [CLS + patches]
+    - Force local loading with local_files_only=True.
+    - Fall back to AutoFeatureExtractor if preprocessor_config.json is unavailable.
+    - Inputs are in [0,1]; the processor runs on CPU and then moves tensors to the encoder device.
+    - Remove register tokens and keep only [CLS + patches].
     """
     def __init__(self, model_path_or_name=DINO_LOCAL_PATH, local_files_only=True):
         super().__init__()
@@ -320,7 +318,7 @@ def load_foundation_encoder(encoder: VisionEncoder, ckpt_path: str, prefer_ema: 
     if state is None:
         raise RuntimeError("Neither ema_state nor student_state found in checkpoint.")
 
-    # 剥掉 'encoder.' 前缀（若存在）
+    # Strip the optional 'encoder.' prefix.
     if any(k.startswith("encoder.") for k in state.keys()):
         state = {k.replace("encoder.", "", 1): v for k, v in state.items()}
 
@@ -378,7 +376,7 @@ class BoneAgeModel(nn.Module):
         return out
 
 # =========================
-# Metrics（按月输出）
+# Metrics reported in months.
 # =========================
 def eval_metrics(preds, targets, name="Eval"):
     preds = np.asarray(preds) * 240.0
@@ -392,7 +390,7 @@ def eval_metrics(preds, targets, name="Eval"):
     return rmse, mad, mae, r2, pcc
 
 # =========================
-# Optim helpers（Muon/AdamW）
+# Optim helpers (Muon/AdamW).
 # =========================
 def _split_params_for_muon(m: nn.Module):
     hidden_weights, hidden_gains_biases = [], []
@@ -505,7 +503,7 @@ def main():
     # start_epoch = 95
     # best_mad = 0.4835
 
-    # 冻结策略
+    # Freeze strategy.
     if FREEZE_ENCODER:
         for p in model.encoder.parameters():
             p.requires_grad = False
@@ -545,6 +543,3 @@ def main():
 if __name__ == "__main__":
     print("Torch:", torch.__version__, " CUDA:", torch.cuda.is_available())
     main()
-
-
-
