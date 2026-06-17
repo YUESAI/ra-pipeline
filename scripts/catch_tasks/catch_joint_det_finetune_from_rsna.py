@@ -10,10 +10,9 @@ Requirements (per your request):
    - split yaml: /home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17/data_split.yaml
 3) Splits usage:
    - 80% train: used for training
-       * additionally split train internally (patient-level) into train_tr + train_es (small early-stopping set)
-   - 10% val: ONLY conformal calibration (never used for early stopping / model selection)
+   - 10% val: used for checkpoint selection; downstream visualization code performs conformal calibration
    - 10% test: final evaluation
-4) When saving best ckpt (selected ONLY by early-stopping set mAP), also print:
+4) Final reporting from the best validation checkpoint:
    - overall mAP (@0.5:0.95, @0.5, @0.75)
    - per joint-type group metrics for: DIP / PIP / MCP / Wrist / Ulna / Radius
      based on 17-class names:
@@ -30,7 +29,6 @@ import os, sys, time, glob, random
 from pathlib import Path
 from argparse import Namespace
 from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -38,7 +36,7 @@ import torch.nn.functional as F
 
 from transformers import AutoModel, AutoImageProcessor
 
-# ==== 本地仓库路径（保持与你之前一致） ====
+# Local repository paths.
 sys.path.append(os.path.abspath('../../repo/yolov12/'))
 sys.path.append(os.path.abspath('../../repo/thop/'))
 sys.path.append(os.path.abspath('../../repo/detr'))
@@ -85,10 +83,6 @@ WEIGHT_DECAY = 1e-4
 # Train strategy
 FREEZE_ENCODER = True
 ENCODER_FREEZE_EPOCHS = 5
-
-# Internal early-stopping split inside TRAIN(80%)
-# patient-level split of the *train list* into train_tr + train_es
-TRAIN_ES_RATIO = 0.05   # 5% of train patients for early-stopping
 
 # Model save
 OUTPUT_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/catch_finetune_from_rsna"
@@ -268,73 +262,6 @@ class JointDEIMv2Updated(nn.Module):
 
 
 # =========================
-# Utils: make internal train_es split txt
-# =========================
-def _read_list_file(p: str) -> List[str]:
-    with open(p, "r") as f:
-        lines = [x.strip() for x in f.readlines()]
-    return [x for x in lines if x]
-
-
-def _write_list_file(p: str, items: List[str]):
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
-        for x in items:
-            f.write(x + "\n")
-
-
-def make_patient_level_split_from_train_txt(
-    train_txt: str,
-    out_dir: str,
-    seed: int = 3407,
-    es_ratio: float = 0.05,
-) -> Tuple[str, str]:
-    """
-    Given data_split.yaml's train.txt (80% patients already),
-    split its patients again into:
-      - train_tr.txt (for training)
-      - train_es.txt (small early-stopping set; NEVER touch calibration val/test)
-    patient_id = basename(img).split('_')[0]
-    """
-    imgs = _read_list_file(train_txt)
-    assert len(imgs) > 0, f"Empty train list: {train_txt}"
-
-    groups = defaultdict(list)
-    for p in imgs:
-        name = os.path.basename(p)
-        pid = name.split("_")[0]
-        groups[pid].append(p)
-
-    pids = sorted(groups.keys())
-    rnd = random.Random(seed)
-    rnd.shuffle(pids)
-
-    n = len(pids)
-    n_es = max(1, int(es_ratio * n))
-    es_pids = set(pids[:n_es])
-    tr_pids = set(pids[n_es:])
-
-    tr_imgs, es_imgs = [], []
-    for pid, ps in groups.items():
-        if pid in es_pids:
-            es_imgs.extend(ps)
-        else:
-            tr_imgs.extend(ps)
-
-    tr_imgs = sorted(tr_imgs)
-    es_imgs = sorted(es_imgs)
-
-    tr_txt = os.path.join(out_dir, f"train_tr_seed{seed}.txt")
-    es_txt = os.path.join(out_dir, f"train_es_seed{seed}.txt")
-    _write_list_file(tr_txt, tr_imgs)
-    _write_list_file(es_txt, es_imgs)
-
-    log(f"[Split] internal train-> train_tr/train_es by patient | patients={n} es_patients={len(es_pids)}")
-    log(f"[Split] images: train_total={len(imgs)} train_tr={len(tr_imgs)} train_es={len(es_imgs)}")
-    return tr_txt, es_txt
-
-
-# =========================
 # Eval: overall + per-group mAP
 # =========================
 def _filter_by_allowed_labels(pred: Dict, gt: Dict, allowed: set) -> Tuple[Dict, Dict]:
@@ -487,28 +414,20 @@ def build_dataloaders():
     """
     Uses DATA_SPLIT_YAML:
       - data['train'] : 80% patient train list
-      - data['val']   : 10% patient val list (CALIBRATION ONLY)
+      - data['val']   : 10% patient validation list for checkpoint selection
       - data['test']  : 10% patient test list
-    Additionally:
-      - internally split train into train_tr + train_es for early stopping
     """
     data = utils.check_det_dataset(DATA_SPLIT_YAML)
 
     assert "train" in data and "val" in data and "test" in data, "data_split.yaml must define train/val/test"
     train_txt = data["train"]
-    calib_txt = data["val"]
+    val_txt = data["val"]
     test_txt  = data["test"]
-
-    # internal train split for early stopping
-    internal_dir = os.path.join(OUTPUT_DIR, "internal_splits")
-    train_tr_txt, train_es_txt = make_patient_level_split_from_train_txt(
-        train_txt=train_txt, out_dir=internal_dir, seed=SEED, es_ratio=TRAIN_ES_RATIO
-    )
 
     # ---- datasets ----
     train_dataset = build.YOLODataset(
         task='detect',
-        img_path=train_tr_txt,
+        img_path=train_txt,
         data=data,
         imgsz=IMG_SIZE,
         batch_size=BATCH_SIZE,
@@ -532,26 +451,9 @@ def build_dataloaders():
         fraction=1.0
     )
 
-    # early-stopping eval set (from train only)
-    es_dataset = build.YOLODataset(
+    val_dataset = build.YOLODataset(
         task='detect',
-        img_path=train_es_txt,
-        data=data,
-        imgsz=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        augment=False,
-        rect=False,
-        cache=None,
-        single_cls=False,
-        stride=32,
-        pad=0.0,
-        fraction=1.0
-    )
-
-    # calibration val (never used for model selection)
-    calib_dataset = build.YOLODataset(
-        task='detect',
-        img_path=calib_txt,
+        img_path=val_txt,
         data=data,
         imgsz=IMG_SIZE,
         batch_size=BATCH_SIZE,
@@ -582,17 +484,15 @@ def build_dataloaders():
 
     # ---- loaders ----
     train_loader = build.build_dataloader(train_dataset, batch=BATCH_SIZE, workers=10, shuffle=True)
-    es_loader    = build.build_dataloader(es_dataset,    batch=BATCH_SIZE, workers=10, shuffle=False)
-    calib_loader = build.build_dataloader(calib_dataset, batch=BATCH_SIZE, workers=10, shuffle=False)
+    val_loader   = build.build_dataloader(val_dataset,   batch=BATCH_SIZE, workers=10, shuffle=False)
     test_loader  = build.build_dataloader(test_dataset,  batch=BATCH_SIZE, workers=10, shuffle=False)
 
     log(f"[Data] Using split yaml: {DATA_SPLIT_YAML}")
-    log(f"[Data] train_tr: {train_tr_txt}")
-    log(f"[Data] train_es: {train_es_txt} (early stop ONLY)")
-    log(f"[Data] calib(val): {calib_txt} (conformal calibration ONLY)")
+    log(f"[Data] train: {train_txt}")
+    log(f"[Data] val: {val_txt} (checkpoint selection)")
     log(f"[Data] test: {test_txt}")
 
-    return train_loader, es_loader, calib_loader, test_loader
+    return train_loader, val_loader, test_loader
 
 
 # =========================
@@ -602,7 +502,7 @@ def main():
     set_seed(SEED)
 
     # data
-    train_loader, es_loader, calib_loader, test_loader = build_dataloaders()
+    train_loader, val_loader, test_loader = build_dataloaders()
 
     # model
     encoder = VisionEncoder(device=DEVICE).to(DEVICE)
@@ -656,11 +556,12 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_es_map = -1.0
+    best_val_map = -1.0
+    best_ckpt_path = None
 
     # ---- initial eval (optional) ----
-    log("Initial evaluation on early-stop set (train_es):")
-    _ = evaluate_detr_like_with_groups(model, es_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag="ES(init)")
+    log("Initial evaluation on validation set:")
+    _ = evaluate_detr_like_with_groups(model, val_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag="VAL(init)")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -710,33 +611,37 @@ def main():
         train_loss = running_loss / max(1, n_samples)
         log(f"Epoch {epoch:03d}/{EPOCHS} | TrainLoss={train_loss:.4f} | time={time.time()-t0:.1f}s")
 
-        # ---- early-stop eval (ONLY for selecting best) ----
-        es_res = evaluate_detr_like_with_groups(
-            model, es_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"ES(ep{epoch})"
+        # ---- validation eval for selecting best ----
+        val_res = evaluate_detr_like_with_groups(
+            model, val_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"VAL(ep{epoch})"
         )
-        es_map = es_res["ALL"]["map"]
+        val_map = val_res["ALL"]["map"]
 
-        if es_map > best_es_map:
-            best_es_map = es_map
-            save_path = os.path.join(OUTPUT_DIR, f"catch_det_from_rsna_best_ep{epoch}_esmap{best_es_map:.4f}.pt")
+        if val_map > best_val_map:
+            best_val_map = val_map
+            save_path = os.path.join(OUTPUT_DIR, f"catch_det_from_rsna_best_ep{epoch}_valmap{best_val_map:.4f}.pt")
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved BEST (by ES mAP) to: {save_path}")
-
-            # ---- when saving best: print group metrics on CALIB and TEST too ----
-            log("---- Evaluate on CALIB (val, conformal calibration set) ----")
-            _ = evaluate_detr_like_with_groups(
-                model, calib_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"CALIB(best@ep{epoch})"
-            )
-
-            log("---- Evaluate on TEST (final set) ----")
-            _ = evaluate_detr_like_with_groups(
-                model, test_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag=f"TEST(best@ep{epoch})"
-            )
+            best_ckpt_path = save_path
+            log(f"Saved BEST (by VAL mAP) to: {save_path}")
 
     log("Training finished.")
-    log(f"Best ES mAP = {best_es_map:.4f}")
+    log(f"Best VAL mAP = {best_val_map:.4f}")
+
+    if best_ckpt_path is None:
+        log("No best checkpoint saved.")
+        return
+
+    log("======= Final: Load best validation checkpoint and report VAL/TEST =======")
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=DEVICE))
+    model.to(DEVICE)
+    log(f"Loaded best ckpt: {best_ckpt_path}")
+    _ = evaluate_detr_like_with_groups(
+        model, val_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag="VAL(best)"
+    )
+    _ = evaluate_detr_like_with_groups(
+        model, test_loader, DEVICE, img_size=IMG_SIZE, groups=JOINT_GROUPS, tag="TEST(best)"
+    )
 
 
 if __name__ == "__main__":
     main()
-

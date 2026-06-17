@@ -41,6 +41,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from catch_split_utils import shared_patient_level_split_3way
 from PIL import Image
 
 import torch
@@ -182,22 +183,14 @@ def patient_level_split_3way(df: pd.DataFrame,
                              train_ratio: float = 0.8,
                              val_ratio: float = 0.1,
                              seed: int = 3407):
-    rng = np.random.RandomState(seed)
-    patients = df["patient_id"].astype(str).unique()
-    rng.shuffle(patients)
-
-    n = len(patients)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-
-    train_p = set(patients[:n_train])
-    val_p = set(patients[n_train:n_train + n_val])
-    test_p = set(patients[n_train + n_val:])
-
-    df_train = df[df["patient_id"].astype(str).isin(train_p)].reset_index(drop=True)
-    df_val = df[df["patient_id"].astype(str).isin(val_p)].reset_index(drop=True)
-    df_test = df[df["patient_id"].astype(str).isin(test_p)].reset_index(drop=True)
-    return df_train, df_val, df_test
+    return shared_patient_level_split_3way(
+        df,
+        patient_col="patient_id",
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+        source_csv_path=CSV_PATH,
+    )
 
 
 def build_hand_level_df_jsn() -> pd.DataFrame:
@@ -645,9 +638,9 @@ def main():
     best_val_pcc = -1e9
     best_ckpt_path = None
 
-    for ep in range(EPOCHS + 1):
+    for ep in range(1, EPOCHS + 1):
         # unfreeze boundary
-        if ep == WARMUP_FREEZE_EPOCHS:
+        if ep == WARMUP_FREEZE_EPOCHS + 1:
             set_requires_grad(model.encoder, True)
             set_requires_grad(model.head_j, True)
             set_requires_grad(model.reg_head, True)
@@ -667,12 +660,10 @@ def main():
 
         tr_m = eval_split(model, train_eval_ld)
         va_m = eval_split(model, val_ld)
-        te_m = eval_split(model, test_ld)  # monitoring only
 
         log(f"Ep {ep:03d}/{EPOCHS:03d} | Loss {tr_loss:.4f} | time {time.time()-t0:.1f}s")
         log_metrics("  [SOFT] TRAIN", tr_m)
         log_metrics("  [SOFT] VAL  ", va_m)
-        log_metrics("  [SOFT] TEST ", te_m)
 
         # conformal
         if USE_CONFORMAL:
@@ -680,8 +671,6 @@ def main():
             q = conformal_q_from_calibration(np.abs(val_y.astype(np.float64) - val_pred.astype(np.float64)), CONFORMAL_ALPHA)
             log_conformal_reg("VAL(calib-self)", CONFORMAL_ALPHA, q, conformal_interval_coverage(val_y, val_pred, q))
 
-            te_pred, te_y, _ = predict_soft(model, test_ld)
-            log_conformal_reg("TEST", CONFORMAL_ALPHA, q, conformal_interval_coverage(te_y, te_pred, q))
 
         # save best by Val PCC only
         curr_val_pcc = va_m.get("pcc", -1e9)
@@ -696,7 +685,6 @@ def main():
                     "epoch": ep,
                     "best_val_soft_pcc": best_val_pcc,
                     "val_metrics_soft": va_m,
-                    "test_metrics_soft": te_m,
                     "config": {
                         "BINARY_CKPT_PATH": BINARY_CKPT_PATH,
                         "DINOV3_MODEL_NAME": DINOV3_MODEL_NAME,

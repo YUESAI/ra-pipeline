@@ -27,6 +27,7 @@ from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
+from catch_split_utils import shared_patient_level_split_3way
 from PIL import Image, ImageOps
 
 import torch
@@ -204,22 +205,14 @@ def patient_level_split_three_way(
     seed: int = 3407,
 ):
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
-    rng = np.random.RandomState(seed)
-    patients = df[PATIENT_COL].astype(str).unique()
-    rng.shuffle(patients)
-
-    n = len(patients)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-
-    train_p = set(patients[:n_train])
-    val_p = set(patients[n_train:n_train + n_val])
-    test_p = set(patients[n_train + n_val:])
-
-    df_tr = df[df[PATIENT_COL].astype(str).isin(train_p)].reset_index(drop=True)
-    df_va = df[df[PATIENT_COL].astype(str).isin(val_p)].reset_index(drop=True)
-    df_te = df[df[PATIENT_COL].astype(str).isin(test_p)].reset_index(drop=True)
-    return df_tr, df_va, df_te
+    return shared_patient_level_split_3way(
+        df,
+        patient_col=PATIENT_COL,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+        source_csv_path=CSV_PATH,
+    )
 
 
 def filter_by_vocab(df: pd.DataFrame, joint2id: Dict[str, int]) -> pd.DataFrame:
@@ -846,9 +839,9 @@ def main():
     best_val_pcc = -1e9
     best_ckpt_path = None
 
-    for ep in range(EPOCHS + 1):
+    for ep in range(1, EPOCHS + 1):
         # unfreeze at boundary + rebuild optimizer
-        if ep == WARMUP_FREEZE_EPOCHS:
+        if ep == WARMUP_FREEZE_EPOCHS + 1:
             set_requires_grad(model.encoder, True)
             for h in model.heads:
                 set_requires_grad(h.gate, True)
@@ -867,11 +860,10 @@ def main():
 
         tr_m = eval_soft(model, train_eval_ld, NUM_CLASSES)
         va_m = eval_soft(model, val_ld,        NUM_CLASSES)
-        te_m = eval_soft(model, test_ld,       NUM_CLASSES)  # monitoring only
 
         curr_val_pcc = va_m.get("pcc", -1e9)
 
-        # Conformal (regression interval): fit on VAL (calib), report on VAL/TES
+        # Conformal (regression interval): fit on VAL (calib), report on VAL during training
         if USE_CONFORMAL:
             # val as calibration
             val_pred, val_y, _ = predict_soft(model, val_ld, NUM_CLASSES)
@@ -882,9 +874,6 @@ def main():
             log_conformal_reg("VAL(calib-self)", CONFORMAL_ALPHA, q, val_stats)
 
             # test
-            te_pred, te_y, _ = predict_soft(model, test_ld, NUM_CLASSES)
-            te_stats = conformal_interval_coverage(te_y, te_pred, q)
-            log_conformal_reg("TEST", CONFORMAL_ALPHA, q, te_stats)
 
         log(
             f"Ep {ep:03d} | Loss {tr_loss:.4f} | "
@@ -892,8 +881,6 @@ def main():
             f"RMSE {tr_m.get('rmse',0):.3f} | MAE {tr_m.get('mae',0):.3f} | R2 {tr_m.get('r2',0):.3f} | ACC {tr_m.get('acc',0):.3f} || "
             f"Val PCC {va_m.get('pcc',0):.3f} | SCC {va_m.get('scc',0):.3f} | QWK {va_m.get('qwk',0):.3f} | "
             f"RMSE {va_m.get('rmse',0):.3f} | MAE {va_m.get('mae',0):.3f} | R2 {va_m.get('r2',0):.3f} | ACC {va_m.get('acc',0):.3f} || "
-            f"Te  PCC {te_m.get('pcc',0):.3f} | SCC {te_m.get('scc',0):.3f} | QWK {te_m.get('qwk',0):.3f} | "
-            f"RMSE {te_m.get('rmse',0):.3f} | MAE {te_m.get('mae',0):.3f} | R2 {te_m.get('r2',0):.3f} | ACC {te_m.get('acc',0):.3f} | "
             f"time {(time.time()-t0):.1f}s"
         )
 
@@ -912,7 +899,6 @@ def main():
                     "epoch": ep,
                     "best_val_soft_pcc": best_val_pcc,
                     "val_metrics_soft": va_m,
-                    "test_metrics_soft": te_m,
                     "config": {
                         "MODEL_NAME": MODEL_NAME,
                         "BINARY_CKPT_PATH": BINARY_CKPT_PATH,
@@ -946,7 +932,6 @@ def main():
             log(f"  ✅ Saved Best (Val SOFT PCC) -> {save_name}")
             # optional breakdown (monitor)
             eval_by_region_soft(model, df_va, joint2id, NUM_CLASSES, split_name="VAL")
-            eval_by_region_soft(model, df_te, joint2id, NUM_CLASSES, split_name="TEST")
 
     if best_ckpt_path is None:
         log("No best checkpoint found.")

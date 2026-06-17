@@ -27,6 +27,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from catch_split_utils import shared_patient_level_split_3way
 from PIL import Image
 
 import torch
@@ -471,27 +472,14 @@ def patient_level_split_3way(df: pd.DataFrame,
                              train_ratio: float = 0.8,
                              val_ratio: float = 0.1,
                              seed: int = 3407):
-    assert 0.0 < train_ratio < 1.0
-    assert 0.0 <= val_ratio < 1.0
-    assert train_ratio + val_ratio < 1.0
-
-    rng = np.random.RandomState(seed)
-    patients = df["patient_id"].astype(str).unique()
-    rng.shuffle(patients)
-
-    n = len(patients)
-    n_train = int(n * train_ratio)
-    n_val   = int(n * val_ratio)
-
-    train_p = set(patients[:n_train])
-    val_p   = set(patients[n_train:n_train + n_val])
-    test_p  = set(patients[n_train + n_val:])
-
-    df_train = df[df["patient_id"].astype(str).isin(train_p)].reset_index(drop=True)
-    df_val   = df[df["patient_id"].astype(str).isin(val_p)].reset_index(drop=True)
-    df_test  = df[df["patient_id"].astype(str).isin(test_p)].reset_index(drop=True)
-
-    return df_train, df_val, df_test
+    return shared_patient_level_split_3way(
+        df,
+        patient_col="patient_id",
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+        source_csv_path=CSV_PATH,
+    )
 
 
 # =========================
@@ -640,23 +628,21 @@ def main():
     loss_main = MaskedBCELoss(pos_weight=POS_WEIGHT_MAIN)
     scaler = GradScaler() if DEVICE == "cuda" else None
 
-    # save best by VAL AUC
+    # Save best by VAL AUC; test is reserved for final reporting.
     best_val_auc = -1.0
+    best_ckpt_path = None
 
-    for ep in range(0, EPOCHS + 1):
+    for ep in range(1, EPOCHS + 1):
         t0 = time.time()
 
         train_loss = train_epoch(model, train_ld, optimizer, loss_main, target_idx, scaler)
 
         tr_m = eval_metrics(model, train_ld, target_idx)
-        va_m = eval_metrics(model, val_ld,   target_idx)
-        te_m = eval_metrics(model, test_ld,  target_idx)
+        va_m = eval_metrics(model, val_ld, target_idx)
 
         log_binary_metrics(f"Train {TASK.capitalize()} (bilateral)", tr_m)
         log_binary_metrics(f"Val   {TASK.capitalize()} (bilateral)", va_m)
-        log_binary_metrics(f"Test  {TASK.capitalize()} (bilateral)", te_m)
 
-        # conformal (calibration = val)
         if USE_CONFORMAL:
             val_logits, val_scores = eval_loader_collect(model, val_ld, target_idx)
             val_mask = val_scores > -0.5
@@ -664,19 +650,9 @@ def main():
             val_true_bin = (val_scores[val_mask] > 0).astype(int)
 
             cal_scores = fit_split_conformal_scores(val_logits, val_true_bin)
-
             val_sets, val_stats = conformal_predict_sets(val_logits, cal_scores, CONFORMAL_ALPHA)
             val_cov = conformal_coverage(val_sets, val_true_bin)
             log_conformal_stats("VAL(calib-self)", CONFORMAL_ALPHA, val_cov, val_stats)
-
-            test_logits, test_scores = eval_loader_collect(model, test_ld, target_idx)
-            test_mask = test_scores > -0.5
-            test_logits = test_logits[test_mask]
-            test_true_bin = (test_scores[test_mask] > 0).astype(int)
-
-            test_sets, test_stats = conformal_predict_sets(test_logits, cal_scores, CONFORMAL_ALPHA)
-            test_cov = conformal_coverage(test_sets, test_true_bin)
-            log_conformal_stats("TEST", CONFORMAL_ALPHA, test_cov, test_stats)
 
         log(
             f"Epoch {ep:03d}/{EPOCHS} | TrainLoss={train_loss:.4f} | "
@@ -691,9 +667,41 @@ def main():
                 f"catch_bilateral_{TASK}_binary_dinov3_amp_ep{ep}_valauc{best_val_auc:.4f}.pt"
             )
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved best (by VAL {TASK.capitalize()} AUC) to {save_path}")
-            if USE_CONFORMAL:
-                log("🧷 (Saved best) Conformal stats above correspond to this epoch.")
+            best_ckpt_path = save_path
+            log(f"Saved best (by VAL {TASK.capitalize()} AUC) to {save_path}")
+
+    if best_ckpt_path is None:
+        log("No best checkpoint saved.")
+        return
+
+    log("======= Final: Load best ckpt and report VAL/TEST + Conformal =======")
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=DEVICE))
+    model.to(DEVICE)
+    log(f"Loaded best ckpt: {best_ckpt_path}")
+
+    va_m = eval_metrics(model, val_ld, target_idx)
+    te_m = eval_metrics(model, test_ld, target_idx)
+    log_binary_metrics(f"Val   {TASK.capitalize()} (bilateral)", va_m)
+    log_binary_metrics(f"Test  {TASK.capitalize()} (bilateral)", te_m)
+
+    if USE_CONFORMAL:
+        val_logits, val_scores = eval_loader_collect(model, val_ld, target_idx)
+        val_mask = val_scores > -0.5
+        val_logits = val_logits[val_mask]
+        val_true_bin = (val_scores[val_mask] > 0).astype(int)
+        cal_scores = fit_split_conformal_scores(val_logits, val_true_bin)
+
+        val_sets, val_stats = conformal_predict_sets(val_logits, cal_scores, CONFORMAL_ALPHA)
+        val_cov = conformal_coverage(val_sets, val_true_bin)
+        log_conformal_stats("VAL(calib-self)", CONFORMAL_ALPHA, val_cov, val_stats)
+
+        test_logits, test_scores = eval_loader_collect(model, test_ld, target_idx)
+        test_mask = test_scores > -0.5
+        test_logits = test_logits[test_mask]
+        test_true_bin = (test_scores[test_mask] > 0).astype(int)
+        test_sets, test_stats = conformal_predict_sets(test_logits, cal_scores, CONFORMAL_ALPHA)
+        test_cov = conformal_coverage(test_sets, test_true_bin)
+        log_conformal_stats("TEST", CONFORMAL_ALPHA, test_cov, test_stats)
 
     log("Training finished.")
 
