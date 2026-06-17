@@ -6,7 +6,7 @@ This repository contains the training and evaluation scripts used for the RADx /
 2. Public downstream transfer tasks.
 3. CATCH joint detection and SvH prediction experiments.
 
-The scripts are research scripts with hardcoded dataset and checkpoint paths from the original compute environment. Before running, update the path constants at the top of each script to match your local data and checkpoint locations.
+The scripts are research scripts with hardcoded dataset and checkpoint paths from the original compute environment. Before running, update the path constants at the top of each script to match the local data and checkpoint locations.
 
 ## Repository Layout
 
@@ -221,14 +221,3 @@ python scripts/catch_tasks/catch_svh_bilateral_jsn_regression_conformal.py
 ```
 
 For scripts with a `TASK` constant, edit the constant at the top of the file to run the corresponding erosion or JSN setting.
-
-## Validation Performed During Code Cleanup
-
-The current code has been statically checked for:
-
-- Python syntax across all scripts.
-- No Chinese comments or log strings in `scripts/`.
-- No known epoch off-by-one loops in the CATCH scripts.
-- CATCH best-checkpoint selection based on validation metrics rather than test metrics.
-- CATCH final test reporting after loading the best validation checkpoint.
-- Whitespace consistency with `git diff --check`.

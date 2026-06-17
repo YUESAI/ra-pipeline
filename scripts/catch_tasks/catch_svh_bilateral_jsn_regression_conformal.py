@@ -9,7 +9,7 @@ Task (regression):
 - Predict JSN_sum (soft regression)
 
 Warm-start:
-- Load encoder + head_j (gate) from your best bilateral JSN binary ckpt
+- Load encoder + head_j (gate) from the best bilateral JSN binary checkpoint
 
 Model:
 - Encoder: DINOv3 ViT-B/16
@@ -106,7 +106,7 @@ ENCODER_LR_MULT = 0.3
 LAMBDA_GATE = 1.0
 LAMBDA_REG = 1.0
 
-# gate imbalance (like your binary)
+# gate imbalance (consistent with the corresponding binary model)
 POS_WEIGHT_GATE = 5.0
 
 # split

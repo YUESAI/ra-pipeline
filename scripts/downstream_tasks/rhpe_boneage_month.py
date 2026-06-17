@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 RHPE Bone Age Prediction (Downstream, EMA-as-encoder, Muon-ready)
-- Encoder: EMA weights from your multi-expert pretrain FM
+- Encoder: EMA weights from the multi-expert pretrain FM
 - Token: selectable -> 'cls' | 'patch_mean' | 'cls_patch_cat'
 - Transforms: ToTensor(); processor do_rescale=False
 - Optim: Muon (if available) + Aux AdamW, fallback to AdamW

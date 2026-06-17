@@ -5,8 +5,8 @@ CATCH Joint-level SvH Score Prediction (Erosion/JSN) with:
 ✅ 5 joints (MCP/PIP/Wrist/Ulna/Radius) joint-specific heads
 ✅ Wrist/Ulna/Radius: keep ONLY labels {0,1,2} (K=3)
 ✅ MCP/PIP: full labels (Erosion K=6 / JSN K=5)
-✅ Gate head = binary-head style (LayerNorm + Linear(D->1)) so it can LOAD your binary ckpt
-✅ Mean pooling (same as your binary script)
+✅ Gate head = binary-head style (LayerNorm + Linear(D->1)) so it can LOAD the corresponding binary checkpoint
+✅ Mean pooling (same as the corresponding binary script)
 ✅ Warm-start: load encoder + gate from binary ckpt, with logs to confirm success
 ✅ Two-stage training:
     - First WARMUP_FREEZE_EPOCHS: freeze encoder+gate, train ordinal only
@@ -14,9 +14,9 @@ CATCH Joint-level SvH Score Prediction (Erosion/JSN) with:
 ✅ Select best ckpt by Val(SOFT) PCC (NO test leakage for selection)
 ✅ Also report SCC/QWK/RMSE/MAE/R2/ACC
 ✅ Add Split Conformal Prediction (calibration = val split): regression interval coverage
-✅ Train metrics computed on a stable loader (no sampler, no drop_last), like your JSN script
+✅ Train metrics computed on a stable loader (no sampler, no drop_last), like the JSN script
 ✅ When saving best ckpt: print per-split (Train/Val/Test) overall + per-joint metrics (SOFT),
-   like your JSN script.
+   like the JSN script.
 
 Run:
   CUDA_VISIBLE_DEVICES=7 nohup python catch_svh_joint_erosion_gate_regression_conformal.py \
@@ -68,7 +68,7 @@ IMG_ROOT = "/home/UWO/ylong66/data/RA/RA/Joint Detection /yolov5/data/extracted_
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/catch_5joints_jointK_warmstart_bestPCC_conformal"
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 
-# Your best binary ckpt (erosion gate)
+# Best binary checkpoint for the erosion gate
 BINARY_CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema/catch_svh_erosion_binary_dinov3_amp.pt" 
 
 # -------- Data columns --------
@@ -113,7 +113,7 @@ USE_WEIGHTED_SAMPLER = True
 REGION_BOOST = {"mcp": 1.0, "pip": 1.6, "wrist": 1.0, "ulna": 1.0, "radius": 1.0}
 NONZERO_BOOST = 1.15
 HIGH_GRADE_BOOST_POWER = 0.35
-SAMPLE_W_CLIP = (1e-4, 10.0)  # align w/ your JSN "sampler clamp" philosophy
+SAMPLE_W_CLIP = (1e-4, 10.0)  # align w/ the JSN sampler-clamping setup
 
 # Gate threshold tuning on Val (optional HARD reporting)
 USE_HARD_GATE_AT_REPORT = True
@@ -391,7 +391,7 @@ class JointSVHGateOrdinalModel(nn.Module):
         D = encoder.hidden_size
         self.jointid2K = {int(k): int(v) for k, v in jointid2K.items()}
         self.maxK = int(max(self.jointid2K.values()))
-        # IMPORTANT: assumes joint_id is 0..N-1 (your joint2id does this)
+        # IMPORTANT: assumes joint_id is 0..N-1 (joint2id is constructed this way)
         self.heads = nn.ModuleList([GateOrdinalHead(D, self.jointid2K[jid]) for jid in sorted(self.jointid2K.keys())])
 
     def forward(self, x, joint_id) -> Tuple[torch.Tensor, torch.Tensor]:

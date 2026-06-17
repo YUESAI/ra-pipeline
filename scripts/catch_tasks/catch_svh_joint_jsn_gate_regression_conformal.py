@@ -4,8 +4,8 @@
 CATCH Joint-level SvH Score Prediction (JSN) with:
 ✅ ONLY 2 joints: MCP/PIP (joint-specific heads)
 ✅ JSN-friendly augmentation: keep aspect ratio (letterbox), no geometric distortion
-✅ Gate head = binary-head style (LayerNorm + Linear(D->1)) so it can LOAD your JSN binary ckpt
-✅ Mean pooling (same as your binary script)
+✅ Gate head = binary-head style (LayerNorm + Linear(D->1)) so it can LOAD the JSN binary checkpoint
+✅ Mean pooling (same as the corresponding binary script)
 ✅ Warm-start: load encoder + gate from JSN binary ckpt, with logs to confirm success
 ✅ Two-stage training:
     - First WARMUP_FREEZE_EPOCHS: freeze encoder+gate, train ordinal only
@@ -62,7 +62,7 @@ IMG_ROOT = "/home/UWO/ylong66/data/RA/RA/Joint Detection /yolov5/data/extracted_
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/catch_jsn_pip_mcp_warmstart_conformal_bestPCC"
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 
-# ✅ Your best JSN binary ckpt (encoder + head_j)
+# ✅ Best JSN binary checkpoint (encoder + head_j)
 BINARY_CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema/catch_svh_jsn_binary_dinov3_amp.pt" 
 
 FILE_COL = "file_name"

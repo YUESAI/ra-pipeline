@@ -3,7 +3,7 @@
 """
 CATCH Joint Detection Finetune (DETR-style) from RSNA-trained checkpoint
 
-Requirements (per your request):
+Requirements:
 1) LOAD RSNA detector ckpt (full model.state_dict, includes encoder)
 2) Read CATCH data from:
    - root: /home/UWO/ylong66/data/RA/RA/external_data/catch_joint_17
@@ -67,7 +67,7 @@ RSNA_DET_CKPT = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema/joint
 # Train
 IMG_SIZE = 224
 BATCH_SIZE = 32
-EPOCHS = 200            # finetune epochs (adjust as you like)
+EPOCHS = 200            # fine-tuning epochs
 SEED = 3407
 
 # Detection heads
@@ -112,7 +112,7 @@ CLASS_NAMES_17 = [
     'Radius', 'Ulna', 'Wrist'
 ]
 
-# 6 joint types you want
+# 6 reported joint-type groups
 JOINT_GROUPS: Dict[str, List[int]] = {
     "DIP":    [0, 1, 2, 3],
     "PIP":    [4, 5, 6, 7, 8],

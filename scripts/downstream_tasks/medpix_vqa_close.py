@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 MedPix VQA (Downstream)
-- Image encoder: DINOv3 student from your pretrained FM (load ema_state)
+- Image encoder: DINOv3 student from the pretrained FM (load ema_state)
 - Token usage: CLS token + patches from image encoder (register tokens removed)
 - Text encoder: BiomedCLIP (PubMedBERT) from open_clip
 - Fusion: Cross-attention (Text queries -> Image keys/values), masked mean pooling, MLP classifier
 - Transforms: No Normalize here (processor handles it); do_rescale=False in VisionEncoder.forward
-- Logging: Same style as your RSNA script; save best by Top-5 accuracy
+- Logging: Same style as the RSNA script; save best by Top-5 accuracy
 """
 
 import os
@@ -133,7 +133,7 @@ def load_student_from_ckpt(encoder: VisionEncoder, ckpt_path: str):
 class MedPixVQADataset(Dataset):
     """
     Each sample: (image, caption) -> label (title)
-    JSON schema assumed like your previous code:
+    JSON schema assumed like the expected data-preparation code:
       e["image"]["id"]   -> jpg filename (with .jpg)
       e["image"]["caption"]
       e["title"]         -> class label

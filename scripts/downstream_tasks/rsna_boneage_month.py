@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 RSNA Bone Age Prediction (Downstream)
-- Image encoder: DINOv3 student from your pretrained FM (load ema_state)
+- Image encoder: DINOv3 student from the pretrained FM (load ema_state)
 - Token usage: CLS token for regression head
 - Transforms: No Normalize here (processor handles it); do_rescale=False in forward
 """

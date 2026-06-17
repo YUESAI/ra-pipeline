@@ -60,7 +60,7 @@ CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_p
 # -------- CATCH joint-level csv --------
 CSV_PATH = "/home/UWO/ylong66/data/RA/RA/SvHScorePrediction/RA_joint_score_raw.csv"
 
-# NOTE: keep your original space in path
+# NOTE: keep the original space in the path
 IMG_ROOT = "/home/UWO/ylong66/data/RA/RA/Joint Detection /yolov5/data/extracted_joint_images"
 
 # HF model

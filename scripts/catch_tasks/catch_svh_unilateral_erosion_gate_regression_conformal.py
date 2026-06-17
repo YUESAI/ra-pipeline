@@ -70,10 +70,10 @@ MAX_SUM_EROSION = 65
 CSV_PATH = "/home/UWO/ylong66/data/RA/RA/SvHScorePrediction/RA_joint_score_raw.csv"
 WHOLE_IMG_ROOT = Path("/home/UWO/ylong66/data/RA/RA/SvHScorePrediction/RA_data/all_RA_update")
 
-# FM pretrain (ema_state) - optional if you want to init from ema_state when no binary ckpt
+# FM pretrain (ema_state) - optional fallback initialization from ema_state when no binary checkpoint is available
 FM_CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
-# ✅ Best binary ckpt you gave
+# ✅ Best task-matched binary checkpoint
 BINARY_CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema_handlevel/catch_hand_erosion_binary_dinov3_amp.pt"
 
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema_handlevel_regression"
@@ -98,7 +98,7 @@ ENCODER_LR_MULT = 0.3      # when unfreezing, encoder lr = LR*0.3
 LAMBDA_GATE = 1.0
 LAMBDA_REG = 1.0
 
-# gate imbalance weight (like your binary)
+# gate imbalance weight (consistent with the corresponding binary model)
 POS_WEIGHT_GATE = 5.0
 
 # split
@@ -145,7 +145,7 @@ eval_tf = T.Compose([
 
 
 # =========================
-# 3) Build hand-level df (same logic as your binary)
+# 3) Build hand-level df (same logic as the corresponding binary script)
 # =========================
 def clean_label(v, nan_val=-1) -> int:
     if pd.isna(v):
@@ -269,7 +269,7 @@ class HandImageDataset(Dataset):
 # =========================
 class VisionEncoder(nn.Module):
     """
-    Same wrapper style as your binary scripts:
+    Same wrapper style as the corresponding binary scripts:
       VisionEncoder.encoder = AutoModel(...)
     """
     def __init__(self, model_name: str = DINOV3_MODEL_NAME, device=None, init_mode: str = "pretrained"):
@@ -344,7 +344,7 @@ class HandGateRegModel(nn.Module):
 
 def warmstart_from_binary_ckpt(model: HandGateRegModel, binary_ckpt_path: str):
     sd = torch.load(binary_ckpt_path, map_location="cpu")
-    # your binary saves: torch.save(model.state_dict(), path)
+    # the binary scripts save: torch.save(model.state_dict(), path)
     if not isinstance(sd, dict):
         raise ValueError("Binary ckpt is not a state_dict dict.")
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -404,7 +404,7 @@ def compute_metrics_reg(y_pred: np.ndarray, y_true: np.ndarray, max_label: int) 
     pcc = float(pearsonr(y, p)[0]) if len(y) > 1 else 0.0
     scc = float(spearmanr(y, p)[0]) if len(y) > 1 else 0.0
 
-    # "ACC/QWK" here follows your joint script style: round->clip->exact match
+    # "ACC/QWK" here follows the joint-level script style: round->clip->exact match
     y_true_cls = y.astype(int)
     y_pred_cls = np.rint(p).astype(int)
     y_pred_cls = np.clip(y_pred_cls, 0, int(max_label))

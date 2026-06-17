@@ -106,7 +106,7 @@ ENCODER_LR_MULT = 0.3             # after unfreeze
 LAMBDA_GATE = 1.0
 LAMBDA_REG = 1.0
 
-# gate imbalance weight (like your binary)
+# gate imbalance weight (consistent with the corresponding binary model)
 POS_WEIGHT_GATE = 5.0
 
 # split
@@ -124,7 +124,7 @@ def log(msg: str):
 
 
 # =========================
-# 2) Image mean/std + transforms (same spirit as your hand binary)
+# 2) Image mean/std + transforms (same preprocessing style as the hand-level binary model)
 # =========================
 _processor_for_stats = AutoImageProcessor.from_pretrained(DINOV3_MODEL_NAME)
 IMAGE_MEAN = _processor_for_stats.image_mean
