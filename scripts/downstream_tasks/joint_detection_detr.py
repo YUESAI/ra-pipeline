@@ -187,7 +187,7 @@ class MLP(nn.Module):
 
 class JointDETRUpdated(nn.Module):
     """
-    - ViT patch tokens → proj → +2D pos → TransformerDecoder
+    - ViT patch tokens -> proj -> +2D pos -> TransformerDecoder
     - queries: learnable
     - aux: per-layer outputs
     - The default length is fixed for 224x224 / 16x16 patches (14x14=196);
@@ -203,7 +203,7 @@ class JointDETRUpdated(nn.Module):
         num_decoder_layers: int = 6,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        num_patches: int = 196,   # 224 / 16 = 14 → 14*14
+        num_patches: int = 196,   # 224 / 16 = 14 -> 14*14
     ):
         super().__init__()
         self.encoder = encoder
@@ -598,7 +598,7 @@ def main():
                 },
                 save_path,
             )
-            log(f"✅ Saved best to: {save_path}")
+            log(f"Saved best to: {save_path}")
 
     log("Training finished.")
 

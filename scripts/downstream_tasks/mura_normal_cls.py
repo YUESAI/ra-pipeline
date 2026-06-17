@@ -3,8 +3,8 @@
 
 """
 MURA XR_HAND Normal/Abnormal Classification (DINOv3, CLS-only Head, safer LR)
-- RANDOM_INIT=True → 随机初始化 DINOv3（不加载任何预训练/旧下游权重）
-- RANDOM_INIT=False → 从 HF + 你的 multi-expert ema_state 加载
+- RANDOM_INIT=True -> randomly initialize DINOv3; do not load pretrained or old downstream weights
+- RANDOM_INIT=False -> load from HF plus the multi-expert ema_state
 """
 
 import os
@@ -22,7 +22,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
 from transformers import AutoModel, AutoImageProcessor, AutoConfig
 
-# ============== 可配置项 ==============
+# ============== Configurable options ==============
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
@@ -31,7 +31,7 @@ TRAIN_LABEL_CSV = f"{DATA_ROOT}/MURA-v1.1/train_labeled_studies.csv"
 VAL_LABEL_CSV   = f"{DATA_ROOT}/MURA-v1.1/valid_labeled_studies.csv"
 TRAIN_IMAGE_CSV = f"{DATA_ROOT}/MURA-v1.1/train_image_paths.csv"
 VAL_IMAGE_CSV   = f"{DATA_ROOT}/MURA-v1.1/valid_image_paths.csv"
-POSITION_FILTER = "XR_HAND"  # None 则不按部位过滤
+POSITION_FILTER = "XR_HAND"  # None disables position filtering
 
 MODEL_NAME = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
@@ -62,17 +62,17 @@ HEAD_LR = 1e-5
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 
-# 训练稳态
+# Training stability
 AMP = True
 EARLY_STOP = 0
 GRAD_CLIP_NORM = 0
 WARMUP_FREEZE_EPOCHS = 0
 
-# 类别不平衡设置
-POS_WEIGHT = 0.0              # <=0 自动计算
+# Class imbalance settings
+POS_WEIGHT = 0.0              # <=0 auto-compute
 WEIGHTED_SAMPLER = True
 
-# 数据增强（仅几何，保持 PIL；不 ToTensor/不 Normalize）
+# Data augmentation: geometry only, keep PIL; no ToTensor/Normalize
 IMG_SIZE = 224
 TRAIN_AUG = T.Compose([
     T.Resize((256, 256)),
@@ -84,12 +84,12 @@ VAL_AUG = T.Compose([
     T.Resize((IMG_SIZE, IMG_SIZE)),
 ])
 
-# ==== 关键对比开关 ====
-RANDOM_INIT = False  # True=随机初始化 encoder；False=加载你预训练 ema_state
+# ==== Key ablation switch ====
+RANDOM_INIT = False  # True=randomly initialize encoder; False loads the pretrained ema_state
 # =====================================
 
 
-# --------- 数据处理 ---------
+# --------- Data processing ---------
 def load_mura_df(label_path, image_path, position_filter: Optional[str] = "XR_HAND"):
     label_df = pd.read_csv(label_path, header=None, names=["study", "label"])
     image_df = pd.read_csv(image_path, header=None, names=["image"])
@@ -117,7 +117,7 @@ class MuraDataset(Dataset):
         return img, label
 
 
-# --------- 指标 ---------
+# --------- Metrics ---------
 def compute_pos_weight(labels: np.ndarray) -> float:
     pos = (labels == 1).sum()
     neg = (labels == 0).sum()
@@ -138,13 +138,13 @@ def eval_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> dict
     }
 
 
-# --------- 编码器（支持随机初始化） ---------
+# --------- Encoder with random-initialization support ---------
 class VisionEncoder(nn.Module):
     """
-    - RANDOM_INIT=True: AutoConfig + AutoModel.from_config（随机初始化）
-    - RANDOM_INIT=False: AutoModel.from_pretrained(MODEL_NAME) 再可选加载 ema_state
+    - RANDOM_INIT=True: AutoConfig + AutoModel.from_config（random initialization）
+    - RANDOM_INIT=False: AutoModel.from_pretrained(MODEL_NAME) then optionally load ema_state
     - forward: processor(images=list_of_PIL)
-    - 去掉 register tokens → 返回 [CLS + patches]
+    - remove register tokens and return [CLS + patches]
     """
     def __init__(self, model_name: str, device: Optional[str] = None, init_mode: str = "pretrained"):
         super().__init__()
@@ -154,13 +154,13 @@ class VisionEncoder(nn.Module):
         if init_mode == "random":
             cfg = AutoConfig.from_pretrained(model_name)
             self.encoder = AutoModel.from_config(cfg)
-            print("⚙️ VisionEncoder: RANDOM init from config.")
+            print("VisionEncoder: RANDOM init from config.")
         else:
             self.encoder = AutoModel.from_pretrained(model_name)
-            print("⚙️ VisionEncoder: loaded HF pretrained weights.")
+            print("VisionEncoder: loaded HF pretrained weights.")
 
-        self.encoder.to(self.device)  # 不 .eval()，保持可训练
-        # self.encoder.to(self.device).eval()  # 不可训练
+        self.encoder.to(self.device)  # do not call .eval(); keep trainable
+        # self.encoder.to(self.device).eval()  # not trainable
 
         cfg = self.encoder.config
         self.hidden_size = getattr(cfg, "hidden_size", None) or getattr(cfg, "hidden_dim", None) \
@@ -185,7 +185,7 @@ class VisionEncoder(nn.Module):
 
 def load_student_from_ckpt(encoder: VisionEncoder, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    # 注意：StateDictMapping 返回 (missing, unexpected)
+    # Note: StateDictMapping returns (missing, unexpected)
     res = encoder.load_state_dict(ckpt["ema_state"], strict=False)
 
     print(f"[CKPT] Loaded ema_state from: {ckpt_path}")
@@ -209,7 +209,7 @@ class CLSHead(nn.Module):
                 nn.Linear(384, 1),
             )
 
-        # # 显式初始化（对随机 encoder 更稳，对预训练也安全）
+        # # Explicit initialization; stable for random encoders and safe for pretrained ones
         # for m in self.net.modules():
         #     if isinstance(m, nn.Linear):
         #         nn.init.xavier_uniform_(m.weight)
@@ -231,7 +231,7 @@ class MURAHandClassifier(nn.Module):
         return self.head(tokens)  # [B]
 
 
-# --------- 训练主逻辑 ---------
+# --------- Main training logic ---------
 def main():
     print("Device:", DEVICE)
 
@@ -266,7 +266,7 @@ def main():
         collate_fn=collate_pil,
     )
 
-    # Encoder & 上游权重
+    # Encoder and upstream weights
     init_mode = "random" if RANDOM_INIT else "pretrained"
     encoder = VisionEncoder(MODEL_NAME, device=DEVICE, init_mode=init_mode).to(DEVICE)
 
@@ -279,16 +279,16 @@ def main():
     head = CLSHead(dim=encoder.hidden_size, hidden=512, linear=False, dropout=0.2).to(DEVICE)
     model = MURAHandClassifier(encoder, head).to(DEVICE)
 
-    # ⚠️ 随机初始化对比：不要加载任何旧的下游 ckpt
-    # model_ckpt_path = "..."  # ← 不要加载
+    # Random-initialization ablation: do not load any old downstream checkpoint
+    # model_ckpt_path = "..."  # do not load
 
-    # 分组学习率
+    # Grouped learning rates
     optimizer = torch.optim.AdamW([
         {"params": model.encoder.parameters(), "lr": ENC_LR,  "weight_decay": WEIGHT_DECAY},
         {"params": model.head.parameters(),    "lr": HEAD_LR, "weight_decay": WEIGHT_DECAY},
     ])
 
-    # # 正负样本权重
+    # # Positive/negative class weights
     # if POS_WEIGHT > 0:
     #     pos_w = torch.tensor([POS_WEIGHT], device=DEVICE)
     # else:
@@ -300,14 +300,14 @@ def main():
 
     scaler = torch.amp.GradScaler('cuda', enabled=AMP)
 
-    # 随机初始化对比：从 0 开始，best_auc = -inf
+    # Random-initialization ablation: start from 0 with best_auc = -inf
     start_epoch = 0 if RANDOM_INIT else 1
     best_auc = float("-inf")
     # best_auc = 0.8
     no_improve = 0
 
     for ep in range(start_epoch, EPOCHS + 1):
-        # ---- 可选热身冻结 ----
+        # ---- Optional warmup freeze ----
         if WARMUP_FREEZE_EPOCHS > 0:
             if ep < WARMUP_FREEZE_EPOCHS:
                 for p in model.encoder.parameters(): p.requires_grad = False
@@ -346,7 +346,7 @@ def main():
         train_loss = total_loss / len(train_loader.dataset)
         train_metrics = eval_metrics_from_logits(torch.cat(logits_all), torch.cat(labels_all))
 
-        # ---- 验证 ----
+        # ---- Validation ----
         model.eval()
         val_logits, val_labels = [], []
         with torch.no_grad():
@@ -361,10 +361,10 @@ def main():
         print(
             f"\nEpoch {ep}/{EPOCHS} "
             f"{'(ENC FROZEN)' if enc_frozen else ''}"
-            f"\n  Train — Loss {train_loss:.4f} | AUC {train_metrics['auc']:.4f} | "
+            f"\n  Train - Loss {train_loss:.4f} | AUC {train_metrics['auc']:.4f} | "
             f"ACC {train_metrics['acc']:.4f} | F1 {train_metrics['f1']:.4f} | "
             f"P {train_metrics['precision']:.4f} | R {train_metrics['recall']:.4f}"
-            f"\n  Val   — AUC {val_metrics['auc']:.4f} | ACC {val_metrics['acc']:.4f} | "
+            f"\n  Val   - AUC {val_metrics['auc']:.4f} | ACC {val_metrics['acc']:.4f} | "
             f"F1 {val_metrics['f1']:.4f} | P {val_metrics['precision']:.4f} | R {val_metrics['recall']:.4f}"
         )
 
@@ -376,14 +376,14 @@ def main():
             tag = "rand" if RANDOM_INIT else f"ckpt{CKPT_EPOCH}"
             ckpt_path = Path(OUTPUT_DIR) / f"mura_normal_v3_{tag}_ep{ep}_auc{best_auc:.4f}.pt"
             torch.save(model.state_dict(), ckpt_path)
-            print(f"☆ 新最佳！Val AUC={best_auc:.4f} 已保存: {ckpt_path}")
+            print(f"New best! Val AUC={best_auc:.4f} saved: {ckpt_path}")
         else:
             no_improve += 1
             if EARLY_STOP > 0 and no_improve >= EARLY_STOP:
-                print(f"早停触发（{EARLY_STOP} epochs 未提升）。最佳 AUC={best_auc:.4f}")
+                print(f"Early stopping triggered ({EARLY_STOP} epochs without improvement). Best AUC={best_auc:.4f}")
                 break
 
-    print(f"训练完成。最佳 Val AUC={best_auc:.4f}")
+    print(f"Training finished. Best Val AUC={best_auc:.4f}")
 
 
 if __name__ == "__main__":

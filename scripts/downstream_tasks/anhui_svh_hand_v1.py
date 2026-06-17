@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hand-level SvH Score Prediction (Anhui) — Clean Baseline (Single-Pipeline, CLS Pooling)
-- 关键修复：
-  1) 只做一次图像几何/规范化处理（转到 transforms，去掉前向里的 AutoImageProcessor）
-  2) CLS pooling 替代 patch-mean
-  3) 从头训练：不加载旧的下游 ckpt，best=-inf
+Hand-level SvH Score Prediction (Anhui) - Clean Baseline (Single-Pipeline, CLS Pooling)
+- Key implementation notes:
+  1) Apply image geometry/normalization once in transforms; remove AutoImageProcessor from forward
+  2) Use CLS pooling instead of patch-mean pooling
+  3) Train from scratch for this downstream run; do not load old downstream checkpoints; best=-inf
   4) AdamW(weight_decay=1e-2) + SmoothL1Loss()
 """
 
@@ -35,40 +35,40 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
 
-# 数据路径
+# Data paths
 IMAGE_DIR  = "/home/UWO/ylong66/data/RA/RA/external_data/anhui/PreparedSharpDataForStudy/"
 LABEL_CSV  = "/home/UWO/ylong66/data/RA/RA/external_data/anhui/PreparedSharpDataForStudy/data/data.csv"
 
-# 划分规模
+# Split sizes
 N_TRAIN = 2700
 N_VAL   = 760
 N_TEST  = 158
 SEED    = 42
 
-# 视觉骨干（优先本地目录）
+# Vision backbone; prefer local directory
 VISION_MODEL_LOCAL_PATH = "/home/UWO/ylong66/data/RA/LLM/hf_model/dinov3-vitb16"
-VISION_MODEL_NAME       = "facebook/dinov3-vitb16"  # 建议与本地模型架构一致（vitb16）
+VISION_MODEL_NAME       = "facebook/dinov3-vitb16"  # should match the local model architecture, e.g. vitb16
 
 FOUNDATION_CKPT_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/"
 
 FOUNDATION_CKPT_FILE = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
-# 超参
+# Hyperparameters
 IMG_SIZE   = 224
 BATCH      = 64
 EPOCHS     = 100
 LR         = 1e-5
-WD         = 0          # ← 加权重衰减
-# HUBER_BETA = 0.02         # 旧：很 L1；现统一用 SmoothL1Loss 默认 β=1.0
+WD         = 0          # ← add weight decay
+# HUBER_BETA = 0.02         # old setting was close to L1; now use SmoothL1Loss default beta=1.0
 
-# 训练策略
-FREEZE_ENCODER = False     # True=只训头；False=端到端
+# Training strategy
+FREEZE_ENCODER = False     # True=train head only; False=end-to-end
 USE_META       = False     # [gender, age]
 
-# ==== 对比实验关键开关 ====
-RANDOM_INIT    = False     # True=随机初始化 encoder；False=加载 HF 预训练（并尽量加载你的 foundation ema_state）
+# ==== Key ablation switch ====
+RANDOM_INIT    = False     # True=random initialization encoder；False=load HF pretrained weights and then the foundation ema_state when available
 
-# 输出
+# Output
 # MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_muon"
 
 # MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema"
@@ -86,7 +86,7 @@ def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
 
 # =========================
-# Build transforms (单次处理，归一化与骨干一致)
+# Build transforms (single-pass preprocessing; normalization matches the backbone)
 # =========================
 def build_transforms():
     src = VISION_MODEL_LOCAL_PATH if os.path.isdir(VISION_MODEL_LOCAL_PATH) else VISION_MODEL_NAME
@@ -100,7 +100,7 @@ def build_transforms():
         T.RandomRotation(degrees=10),
         T.CenterCrop(IMG_SIZE),
         T.ToTensor(),                     # [0,1]
-        T.Normalize(mean=mean, std=std),  # 与骨干一致
+        T.Normalize(mean=mean, std=std),  # matches the backbone
     ])
     eval_tf = T.Compose([
         T.Resize((256, 256)),
@@ -156,10 +156,10 @@ def split_anhui_df(df: pd.DataFrame, image_dir: str, seed=42,
 # =========================
 class VisionEncoder(nn.Module):
     """
-    - RANDOM_INIT=True -> AutoConfig + AutoModel.from_config 随机初始化
-    - RANDOM_INIT=False -> AutoModel.from_pretrained（并可选加载你的 ema_state）
-    - 前向不再做任何 resize/crop/normalize；这些已在 transforms 完成
-    - 输出 [B, 1+P(+R), D]，后续用 CLS token
+    - RANDOM_INIT=True -> AutoConfig + AutoModel.from_config random initialization
+    - RANDOM_INIT=False -> AutoModel.from_pretrained, then optionally load ema_state
+    - forward no longer performs resize/crop/normalize; transforms already handle them
+    - Output [B, 1+P(+R), D], then use the CLS token
     """
     def __init__(self, device=None, init_mode: str = "pretrained"):
         super().__init__()
@@ -170,10 +170,10 @@ class VisionEncoder(nn.Module):
         if init_mode == "random":
             cfg = AutoConfig.from_pretrained(src)
             self.encoder = AutoModel.from_config(cfg)
-            log("⚙️ VisionEncoder: initialized RANDOM weights from config.")
+            log("VisionEncoder: initialized RANDOM weights from config.")
         else:
             self.encoder = AutoModel.from_pretrained(src)
-            log("⚙️ VisionEncoder: loaded HF pretrained weights.")
+            log("VisionEncoder: loaded HF pretrained weights.")
 
         self.encoder.to(self.device)
 
@@ -183,7 +183,7 @@ class VisionEncoder(nn.Module):
         self.num_register_tokens = getattr(cfg, "num_register_tokens", 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x 已是 [B,3,H,W]、已 Normalize 到骨干期望
+        # x is already [B,3,H,W] and normalized as expected by the backbone
         x = x.to(self.device, dtype=torch.float32)
         out = self.encoder(pixel_values=x, output_hidden_states=False)
         tokens = out.last_hidden_state  # [B, 1+R+P, D]
@@ -192,13 +192,13 @@ class VisionEncoder(nn.Module):
 def load_student_from_ckpt(encoder: VisionEncoder):
     ck = Path(FOUNDATION_CKPT_FILE)
     if not ck.exists():
-        log(f"⚠️ 未找到预训练 ema_state：{ck}；继续使用 HF 权重。")
+        log(f"Pretrained ema_state not found: {ck}; continue with HF weights.")
         return
     state = torch.load(ck, map_location="cpu")
     # key = "ema_state" if "ema_state" in state else None
     key = "ema_state" if "ema_state" in state else None
     if key is None:
-        log(f"⚠️ ckpt 中未找到 'ema_state'，忽略加载。")
+        log(f"No ema_state found in checkpoint; skip loading.")
         return
     res = encoder.load_state_dict(state[key], strict=False)
     log(f"Loaded ema_state from {ck}")
@@ -208,7 +208,7 @@ def load_student_from_ckpt(encoder: VisionEncoder):
         if len(unexp): log(f"  Unexpected keys: {len(unexp)} (first 5) {unexp[:5]}")
 
 # =========================
-# Model (CLS → regression head)
+# Model (CLS -> regression head)
 # =========================
 class WholeSVHModel(nn.Module):
     def __init__(self, encoder: VisionEncoder, use_meta: bool = False):
@@ -232,7 +232,7 @@ class WholeSVHModel(nn.Module):
             nn.Linear(64, 1)
         )
 
-        # 显式初始化回归头（Xavier）
+        # Explicitly initialize the regression head with Xavier
         for m in self.head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -247,7 +247,7 @@ class WholeSVHModel(nn.Module):
 
     def forward(self, x: torch.Tensor, meta: torch.Tensor | None = None) -> torch.Tensor:
         tokens = self.encoder(x)               # [B, 1+R+P, D]
-        feat = tokens[:, 0, :]                 # ← 使用 CLS
+        feat = tokens[:, 0, :]                 # use CLS
         if self.use_meta:
             meta_feat = self.meta_fc(meta)
             feat = torch.cat([feat, meta_feat], dim=1)
@@ -260,7 +260,7 @@ class WholeSVHModel(nn.Module):
 class SmoothL1(nn.Module):
     def __init__(self):
         super().__init__()
-        self.crit = nn.SmoothL1Loss()  # β=1.0
+        self.crit = nn.SmoothL1Loss()  # beta=1.0
 
     def forward(self, pred, target):
         return self.crit(pred, target)
@@ -321,16 +321,16 @@ def train_epoch(model, loader, optimizer, loss_fn) -> float:
 # Main
 # =========================
 def main():
-    # 固定随机性
+    # Fix randomness
     torch.manual_seed(SEED); np.random.seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-    # 读取并划分
+    # Read and split data
     df_all = pd.read_csv(LABEL_CSV)
     tr_df, va_df, te_df = split_anhui_df(df_all, IMAGE_DIR, seed=SEED,
                                           n_train=N_TRAIN, n_val=N_VAL, n_test=N_TEST)
     log(f"Samples -> Train: {len(tr_df)} | Valid: {len(va_df)} | Test: {len(te_df)}")
 
-    # Datasets & Loaders（不丢样本）
+    # Datasets and loaders; do not drop samples
     train_ds = AnhuiDatasetWithMeta(tr_df, IMAGE_DIR, train_tf, use_meta=USE_META)
     valid_ds = AnhuiDatasetWithMeta(va_df, IMAGE_DIR, eval_tf,   use_meta=USE_META)
     test_ds  = AnhuiDatasetWithMeta(te_df, IMAGE_DIR, eval_tf,   use_meta=USE_META)
@@ -347,7 +347,7 @@ def main():
     encoder = VisionEncoder(device=DEVICE, init_mode=init_mode).to(DEVICE)
 
     if not RANDOM_INIT:
-        load_student_from_ckpt(encoder)   # 若找不到或没有 ema_state，会自动忽略
+        load_student_from_ckpt(encoder)   # skip automatically if missing or no ema_state is present
         log("Encoder initialized from pretrained FM (ema_state if available).")
     else:
         log("Encoder randomly initialized (no pretrained weights).")
@@ -373,7 +373,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
     loss_fn   = SmoothL1()
 
-    # 训练循环（从 0 开始；best = -inf）
+    # Training loop; start from 0 with best = -inf
     best_path = None
 
     for ep in range(start_ep, start_ep + EPOCHS):
@@ -383,7 +383,7 @@ def main():
         m_tr = eval_loader(model, train_ld);  log_metrics("Train", m_tr)
         m_va = eval_loader(model, valid_ld);  log_metrics("Valid", m_va)
 
-        # 保存：以验证集 PCC 为准
+        # Save according to validation PCC
         if (m_va["pcc"] > best_val_pcc) or (best_path is None):
             best_val_pcc = m_va["pcc"]
             tag = "rand" if RANDOM_INIT else "pre"
@@ -391,7 +391,7 @@ def main():
                 MODEL_SAVE_DIR, f"anhui_svh_hand_{tag}_v1_ep{ep}_pcc_{best_val_pcc:.4f}.pt"
             )
             torch.save(model.state_dict(), best_path)
-            log(f"✅ Saved best-by-Valid-PCC to {best_path}")
+            log(f"Saved best-by-Valid-PCC to {best_path}")
 
         log(f"Epoch {ep:03d}/{start_ep + EPOCHS - 1} | TrainLoss={train_loss:.4f} | "
             f"Val PCC={m_va['pcc']:.4f} | Time {time.time()-t0:.1f}s")

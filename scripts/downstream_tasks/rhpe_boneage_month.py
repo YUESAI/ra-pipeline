@@ -344,7 +344,7 @@ def _feat_from_tokens(tokens: torch.Tensor, mode: str) -> torch.Tensor:
         raise ValueError(f"Unsupported TOKEN_MODE: {mode}")
 
 class BoneAgeModel(nn.Module):
-    """Image (+ optional gender) → bone age"""
+    """Image (+ optional gender) -> bone age"""
     def __init__(self, encoder: VisionEncoder, token_mode: str = "cls", use_meta: bool = True):
         super().__init__()
         self.encoder = encoder
@@ -536,7 +536,7 @@ def main():
                 f"rhpe_boneage_{tag}_{ema_tag}_{TOKEN_MODE}_ep{ep}_MAD{best_mad:.4f}_PCC{pcc:.4f}.pt"
             )
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved best model to {save_path}")
+            log(f"Saved best model to {save_path}")
 
     log("Training finished.")
 

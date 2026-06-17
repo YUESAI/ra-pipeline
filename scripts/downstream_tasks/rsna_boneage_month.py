@@ -33,22 +33,22 @@ from scipy.stats import pearsonr
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
-# 你的预训练 FM（multi-expert）的 checkpoint（只读 ema_state）
+# Pretrained multi-expert FM checkpoint; load ema_state only
 CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
-# RSNA 数据（保持硬编码，不从命令行传入）
+# RSNA data; hardcoded paths, no CLI arguments
 TRAIN_IMG_DIR = "/data/lab_ph/shared/RA/external_data/RSNA/training_set/boneage-training-dataset"
 TRAIN_CSV     = "/data/lab_ph/shared/RA/external_data/RSNA/training_set/train.csv"
 VAL_IMG_DIR   = "/data/lab_ph/shared/RA/external_data/RSNA/val_set/Bone Age Validation Set/val_set/boneage-validation-dataset"
 VAL_CSV       = "/data/lab_ph/shared/RA/external_data/RSNA/val_set/Validation Dataset.csv"
 
-# 训练超参（如需改，直接改这里的常量）
+# Training hyperparameters; edit constants here if needed
 IMG_SIZE = 224
 BATCH    = 32
 EPOCHS   = 100
-LR       = 1e-4         # 你之前写的是 1e-6，容易训练很慢/不稳定；这里用 1e-4 更常见
-USE_META = True          # 是否使用性别元信息
-FREEZE_ENCODER = False    # True=只训头；False=端到端微调
+LR       = 1e-4         # 1e-4 is used for stable downstream training
+USE_META = True          # whether to use sex metadata
+FREEZE_ENCODER = False    # True=train head only; False=end-to-end fine-tuning
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/dinov3_multiexpert"
 
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
@@ -79,11 +79,11 @@ class RSNADataset(Dataset):
         self.df = pd.read_csv(csv_path)
         self.transform = transform
 
-        # 兼容 RSNA csv 的列名：id / boneage / male
-        # male 可能是 0/1 或 True/False；做个兜底
+        # Support RSNA CSV columns: id / boneage / male
+        # male may be 0/1 or True/False; handle both
         for col in ["id", "boneage", "male"]:
             if col not in self.df.columns:
-                raise RuntimeError(f"CSV 缺少列: {col}")
+                raise RuntimeError(f"CSV missing column: {col}")
 
     def __len__(self):
         return len(self.df)
@@ -96,11 +96,11 @@ class RSNADataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        # 归一化 bone age 到 0~1（以 240 月为基准）
+        # Normalize bone age to 0-1 using 240 months as reference
         bone_age = float(row["boneage"]) / 240.0
         bone_age = torch.tensor(bone_age, dtype=torch.float32)
 
-        # 性别布尔/数值 to {0,1} float
+        # Convert sex boolean/numeric values to {0,1} float
         val = row["male"]
         if pd.isna(val):
             val = 0
@@ -116,9 +116,9 @@ class RSNADataset(Dataset):
 # =========================
 class VisionEncoder(nn.Module):
     """
-    与预训练阶段保持一致：
-    - AutoImageProcessor 做归一化/resize；这里 images=list(x), do_rescale=False
-    - 去掉 DINOv3 的 register tokens，保留 [CLS+patches]
+    Keep consistent with pretraining:
+    - AutoImageProcessor handles normalization/resize; images=list(x), do_rescale=False
+    - Remove DINOv3 register tokens and keep [CLS+patches]
     """
     def __init__(self, model_name="facebook/dinov3-vitb16-pretrain-lvd1689m", device=None):
         super().__init__()
@@ -162,7 +162,7 @@ def load_student_from_ckpt(encoder: VisionEncoder, ckpt_path: str):
 # Heads
 # =========================
 class BoneAgeModel(nn.Module):
-    """Image → bone age"""
+    """Image -> bone age"""
     def __init__(self, encoder: VisionEncoder):
         super().__init__()
         self.encoder = encoder
@@ -180,7 +180,7 @@ class BoneAgeModel(nn.Module):
         return out
 
 class BoneAgeModelWithMeta(nn.Module):
-    """Image + gender → bone age"""
+    """Image + gender -> bone age"""
     def __init__(self, encoder: VisionEncoder):
         super().__init__()
         self.encoder = encoder
@@ -277,7 +277,7 @@ def main():
     encoder = VisionEncoder(device=DEVICE).to(DEVICE)
     load_student_from_ckpt(encoder, CKPT_PATH)
 
-    # 冻结/解冻
+    # Freeze/unfreeze
     if FREEZE_ENCODER:
         for p in encoder.parameters():
             p.requires_grad = False
@@ -294,7 +294,7 @@ def main():
     # print(f"[MODEL] Loaded model state from: {model_ckpt_path}")
 
     # Optim / Loss
-    # 仅训练 head 时，较大学习率问题不大；端到端微调时可把 LR 调小一些（如 1e-5）
+    # Larger LR is acceptable for head-only training; for end-to-end fine-tuning LR can be reduced, e.g. 1e-5
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     loss_fn = nn.SmoothL1Loss(reduction="mean")
 
@@ -311,7 +311,7 @@ def main():
             f"Val MAD={mad:.3f} RMSE={rmse:.3f} MAE={mae:.3f} R2={r2:.3f} PCC={pcc:.3f} | "
             f"Time {time.time()-t0:.1f}s")
 
-        # 保存最好模型（按 MAD）
+        # Save best model by MAD
         if mad < best_mad:
             best_mad = mad
             tag = "meta" if USE_META else "img"
@@ -320,7 +320,7 @@ def main():
                 f"rsna_boneage_{tag}_20_ep{ep}_MAD{best_mad:.4f}_PCC{pcc:.4f}.pt"
             )
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved best model to {save_path}")
+            log(f"Saved best model to {save_path}")
 
     log("Training finished.")
 

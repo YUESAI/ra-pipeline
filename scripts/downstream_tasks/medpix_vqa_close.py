@@ -50,8 +50,8 @@ EPOCHS   = 1000
 LR       = 1e-4
 WEIGHT_DECAY = 1e-4
 
-FREEZE_VISION = False   # True: 冻结视觉编码器，仅训跨模态与分类头
-FREEZE_TEXT   = True    # True: 冻结文本编码器
+FREEZE_VISION = False   # True: freeze the vision encoder and train only the fusion/classification heads
+FREEZE_TEXT   = True    # True: freeze the text encoder
 
 MODEL_SAVE_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema"
 
@@ -177,7 +177,7 @@ class MedPixVQADataset(Dataset):
                 skipped += 1
                 continue
 
-        log(f"✅ Loaded {kept} VQA samples | {len(self.label2id)} unique labels | skipped={skipped}")
+        log(f"Loaded {kept} VQA samples | {len(self.label2id)} unique labels | skipped={skipped}")
 
     def __len__(self):
         return len(self.samples)
@@ -371,17 +371,17 @@ def main():
     full_ds = MedPixVQADataset(
         json_path=JSON_PATH,
         image_dir=IMAGE_DIR,
-        transform=val_tf,      # 可选：train 用 train_tf；此处与你旧版一致使用 valid_tf
+        transform=val_tf,      # Optional: use train_tf for training; keep val_tf here for consistency with the original run
         tokenizer=tokenizer
     )
 
-    # 固定划分
+    # Fixed split
     generator = torch.Generator().manual_seed(SEED)
     total_len = len(full_ds)
     val_len = round(VAL_SPLIT * total_len)
     train_len = total_len - val_len
     train_ds, val_ds = random_split(full_ds, [train_len, val_len], generator=generator)
-    log(f"🔀 Split dataset: {train_len} train / {val_len} val")
+    log(f"Split dataset: {train_len} train / {val_len} val")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
                               num_workers=4, pin_memory=True, persistent_workers=True,
@@ -394,7 +394,7 @@ def main():
     encoder = VisionEncoder(device=DEVICE).to(DEVICE)
     load_student_from_ckpt(encoder, CKPT_PATH)
 
-    # 冻结策略
+    # Freeze policy
     if FREEZE_VISION:
         for p in encoder.parameters():
             p.requires_grad = False
@@ -436,7 +436,7 @@ def main():
             )
             torch.save(model.state_dict(), save_path)
             best_path = save_path
-            log(f"✅ Saved best model to {save_path}")
+            log(f"Saved best model to {save_path}")
 
     log(f"Training finished. Best Top-5={best_top5:.4f} | ckpt={best_path}")
 

@@ -3,10 +3,10 @@
 """
 Bone Segmentation with DINOv3 FM (DETR-style, joint seg + det heads)
 
-改进版要点：
-- Seg head 改成 14x14 -> 56x56 -> 224x224 的语义分割头，最终直接输出到输入分辨率
-- Seg loss = 加权 CE + 0.5 * Dice，缓解前景被背景淹没的问题
-- Seg head 轻量耦合 decoder 的全局语义（把最后一层 decoder 的 query 特征做一个全局注入）
+Implementation notes:
+- Segmentation head upsamples 14x14 -> 56x56 -> 224x224 and outputs at input resolution
+- Segmentation loss = weighted CE + 0.5 * Dice to mitigate foreground/background imbalance
+- The segmentation head injects global decoder semantics from the final query features
 """
 
 import os, sys, time
@@ -21,7 +21,7 @@ from torchvision import transforms
 
 from transformers import AutoModel, AutoImageProcessor
 
-# ==== 本地仓库路径（与之前保持一致） ====
+# ==== Local repository paths ====
 sys.path.append(os.path.abspath('../../repo/yolov12/'))
 sys.path.append(os.path.abspath('../../repo/thop/'))
 sys.path.append(os.path.abspath('../../repo/detr'))
@@ -35,7 +35,7 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from matcher import HungarianMatcher
 from detr import SetCriterion, PostProcess
 from transformer import Transformer
-from position_encoding import PositionEmbeddingSine  # 也可切换 PositionEmbeddingLearned
+from position_encoding import PositionEmbeddingSine  # can be switched to PositionEmbeddingLearned
 
 # =========================
 # Config
@@ -43,29 +43,29 @@ from position_encoding import PositionEmbeddingSine  # 也可切换 PositionEmbe
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(2)
 
-# —— Foundation Model checkpoint（优先 ema_state）——
+# -- Foundation model checkpoint; prefer ema_state--
 CKPT_PATH = "/home/UWO/ylong66/data/RA/LLM/ckpt/pretrain/multi_expert_v1/handx_pretrain_multiexpert_224_10.pt"
 
-# —— 数据集（ultralytics segment 任务）——
+# -- Dataset; Ultralytics segment task--
 IMG_SIZE   = 224
 BATCH_SIZE = 32
 EPOCHS     = 1000
 
-# —— 类别/queries ——（注意：NUM_CLASSES 为不含背景的前景类别数）
+# -- Classes/queries; NUM_CLASSES excludes the background class
 NUM_CLASSES = 19
 NUM_QUERIES = 100
 EOS_COEF    = 0.1
 
-# —— 优化器/训练 ——
+# -- Optimizer/training --
 LR = 2e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 0.1
 
-# —— 模型保存 ——
+# -- Model output --
 OUTPUT_DIR = "/home/UWO/ylong66/data/RA/LLM/ckpt/train/multi_expert_ema"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# —— 是否冻结 Encoder ——
+# -- Whether to freeze the encoder --
 FREEZE_ENCODER = False
 
 
@@ -78,9 +78,9 @@ def log(msg: str):
 # =========================
 class VisionEncoder(nn.Module):
     """
-    - 输入：batch tensor in [0,1], shape [B, 3, H, W]
-    - 内部：AutoImageProcessor 做标准化/resize（do_rescale=False）
-    - 输出：只返回 patch tokens [B, P, D]（去掉CLS & register tokens）
+    - Input: batch tensor in [0,1], shape [B, 3, H, W]
+    - Internally uses AutoImageProcessor for normalization/resize (do_rescale=False)
+    - Output: patch tokens [B, P, D] only, with CLS/register tokens removed
     """
     def __init__(self, model_name="facebook/dinov3-vitb16-pretrain-lvd1689m", device=None):
         super().__init__()
@@ -149,9 +149,9 @@ def load_foundation_encoder(encoder: VisionEncoder, ckpt_path: str, prefer_ema: 
 # =========================
 class SegHead(nn.Module):
     """
-    简单语义分割头：14x14 -> 56x56 -> 224x224
-    输入：encoder+transformer 后的空间特征 [B, d_model, S, S]
-    输出：语义 logits [B, C+1, H, W]
+    Simple semantic segmentation head: 14x14 -> 56x56 -> 224x224
+    Input: spatial features after encoder+transformer [B, d_model, S, S]
+    Output: semantic logits [B, C+1, H, W]
     """
     def __init__(self, d_model=256, num_classes=19 + 1, out_size=(224, 224)):
         super().__init__()
@@ -179,12 +179,12 @@ class SegHead(nn.Module):
 # =========================
 class SegmentationModel(nn.Module):
     """
-    - ViT patch tokens → 重排为 2D feature map (Hf x Wf)，再 1x1 conv 投到 d_model
+    - ViT patch tokens -> reshape into a 2D feature map (Hf x Wf), then project to d_model with a 1x1 conv
     - Transformer: encoder/decoder
     - Outputs:
         * pred_logits: [B, Q, C+1]
         * pred_boxes:  [B, Q, 4] (cxcywh in [0,1])
-        * pred_masks:  [B, C+1, H, W] (直接输入分辨率)
+        * pred_masks:  [B, C+1, H, W] (input resolution)
     """
     def __init__(self, encoder: VisionEncoder, num_queries=100, d_model=256, nhead=8, num_classes=19):
         super().__init__()
@@ -210,7 +210,7 @@ class SegmentationModel(nn.Module):
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
             nn.ReLU(inplace=True),
-            nn.Linear(d_model, num_classes + 1)   # +背景
+            nn.Linear(d_model, num_classes + 1)   # + background
         )
         self.bbox_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -222,7 +222,7 @@ class SegmentationModel(nn.Module):
             nn.Linear(d_model, 4)
         )
 
-        # 新的 seg head
+        # Segmentation head
         self.seg_head = SegHead(d_model=d_model, num_classes=num_classes + 1, out_size=(IMG_SIZE, IMG_SIZE))
 
         self.position_embedding = PositionEmbeddingSine(d_model // 2, normalize=True)
@@ -243,7 +243,7 @@ class SegmentationModel(nn.Module):
         outputs_class = self.class_head(hs)               # [layers, B, Q, C+1]
         outputs_coord = self.bbox_head(hs).sigmoid()      # [layers, B, Q, 4]
 
-        # 轻量耦合：把最后一层 decoder 的全局语义加到特征上
+        # Light coupling: add global semantics from the final decoder layer to the feature map
         dec_feat = hs[-1].mean(1)                         # [B, d_model]
         dec_feat = dec_feat[:, :, None, None].expand(-1, -1, src_proj.shape[2], src_proj.shape[3])
         seg_in = src_proj + dec_feat
@@ -344,9 +344,9 @@ def dice_loss(inputs, targets, num_classes, eps=1e-6):
 @torch.no_grad()
 def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_CLASSES):
     """
-    - 分类指标(基于 Hungarian 匹配)
-    - 检测 mAP @0.5:0.95, @0.5, @0.75
-    - 分割像素级 ACC / P / R / F1
+    - Classification metrics based on Hungarian matching
+    - Detection mAP @0.5:0.95, @0.5, @0.75
+    - Pixel-level segmentation ACC / P / R / F1
     """
     model.eval()
     matched_preds, matched_labels = [], []
@@ -378,7 +378,7 @@ def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_C
         orig_target_sizes = torch.tensor([[img_size, img_size]] * B).to(device, dtype=torch.long)
         results = postprocessor(outputs, orig_target_sizes)
 
-        # —— 分类（基于匹配）——
+        # -- Classification based on matching--
         indices = matcher(outputs, targets)
         for i, (pred_idx, tgt_idx) in enumerate(indices):
             if len(pred_idx) == 0:
@@ -389,7 +389,7 @@ def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_C
             matched_preds  += pclasses
             matched_labels += tclasses
 
-        # —— 分割指标 ——（现在 pred_masks 已经是 224x224）
+        # -- Segmentation metrics; pred_masks are already 224x224
         seg_logits = outputs['pred_masks']  # [B, C+1, H, W]
         pmasks = seg_logits.argmax(dim=1).cpu().flatten().tolist()
         tmasks = masks.flatten().cpu().tolist()
@@ -400,7 +400,7 @@ def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_C
         pixel_rs.append(recall_score(tmasks, pmasks, average='macro', zero_division=0))
         pixel_f1s.append(f1_score(tmasks, pmasks, average='macro', zero_division=0))
 
-        # —— mAP 输入 ——
+        # -- mAP inputs --
         for i in range(B):
             result = results[i]
             preds_for_map.append({
@@ -414,7 +414,7 @@ def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_C
                 "labels": targets[i]['labels'].cpu(),
             })
 
-    # 分类
+    # Classification
     from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
     if matched_preds:
         prec = precision_score(matched_labels, matched_preds, average='macro', zero_division=0)
@@ -423,14 +423,14 @@ def evaluate(model, val_loader, device, matcher, img_size=224, num_classes=NUM_C
         acc  = accuracy_score( matched_labels, matched_preds)
         log(f"📊 Classification: ACC={acc:.4f}, P={prec:.4f}, R={rec:.4f}, F1={f1:.4f}")
     else:
-        log("⚠️  No matched prediction → skip classification metrics")
+        log(" No matched prediction -> skip classification metrics")
 
-    # 检测 mAP
+    # Detection mAP
     metric.update(preds_for_map, gts_for_map)
     res = metric.compute()
     log(f"📊 Detection mAP: @0.5:0.95={res['map']:.4f}, @0.5={res['map_50']:.4f}, @0.75={res['map_75']:.4f}")
 
-    # 分割
+    # Segmentation
     log(f"📊 Segmentation: ACC={sum(pixel_accs)/len(pixel_accs):.4f}, "
         f"P={sum(pixel_ps)/len(pixel_ps):.4f}, R={sum(pixel_rs)/len(pixel_rs):.4f}, "
         f"F1={sum(pixel_f1s)/len(pixel_f1s):.4f}")
@@ -476,7 +476,7 @@ def main():
     losses = ['labels', 'boxes', 'cardinality']
     weight_dict = {'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2}
     aux_weight_dict = {}
-    for i in range(3 - 1):  # num_decoder_layers-1（此处为 3-1）
+    for i in range(3 - 1):  # num_decoder_layers - 1; here 3 - 1
         aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
     weight_dict.update(aux_weight_dict)
 
@@ -488,11 +488,11 @@ def main():
         losses=losses
     ).to(DEVICE)
 
-    # Optimizer（encoder 小 LR）
+    # Optimizer; smaller LR for encoder
     param_main = [{"params": [p for n,p in model.named_parameters() if p.requires_grad and not n.startswith("encoder.")],
                    "lr": LR}]
     if not FREEZE_ENCODER:
-        enc_lr = LR * 0.5  # 再小一点也行，比如 0.25
+        enc_lr = LR * 0.5  # can be smaller, e.g. 0.25
         enc_params = [p for n,p in model.named_parameters() if p.requires_grad and n.startswith("encoder.")]
         param_main.append({"params": enc_params, "lr": enc_lr})
     optimizer = torch.optim.AdamW(param_main, lr=LR, weight_decay=WEIGHT_DECAY)
@@ -508,7 +508,7 @@ def main():
 
             cls_ = batch['cls']
             bboxes = batch['bboxes']
-            masks = batch['masks'].long().to(DEVICE)          # [B, H, W] 像素类别（含背景）
+            masks = batch['masks'].long().to(DEVICE)          # [B, H, W] pixel classes, including background
             batch_idx = batch['batch_idx']
 
             targets = [
@@ -526,10 +526,10 @@ def main():
             wd = criterion.weight_dict
             det_loss = sum(loss_dict[k] * wd[k] for k in loss_dict.keys() if k in wd)
 
-            # Segmentation loss（直接用 224x224）
+            # Segmentation loss directly at 224x224
             seg_logits = outputs['pred_masks']  # [B, C+1, H, W]
 
-            # class weights: 背景权重低一点
+            # class weights: lower background weight
             class_weights = torch.ones(NUM_CLASSES + 1, device=DEVICE)
             class_weights[0] = 0.3
             seg_ce = F.cross_entropy(seg_logits, masks, weight=class_weights)
@@ -550,8 +550,8 @@ def main():
         avg_loss = total_loss / max(1, n_imgs)
         log(f"Epoch {epoch:03d} | TrainLoss={avg_loss:.4f} | time={time.time()-t0:.1f}s")
 
-        # ==== Eval 前做一点 sanity check ====
-        # 看下第一批 val 的 GT 数量
+        # ==== Small sanity check before eval ====
+        # Check the number of GT instances in the first validation batch
         with torch.no_grad():
             for batch in val_loader:
                 bi = batch['batch_idx']
@@ -559,7 +559,7 @@ def main():
                 gt_obj_cnt = 0
                 for i in range(batch['img'].shape[0]):
                     gt_obj_cnt += int((bi == i).sum().item())
-                log(f"[DEBUG] val首批GT实例数: {gt_obj_cnt}")
+                log(f"[DEBUG] first validation batch GT instances: {gt_obj_cnt}")
                 break
 
         # Eval
@@ -570,7 +570,7 @@ def main():
                 OUTPUT_DIR, f"bone_seg_dinov3_ema_ep{epoch}_map{best_map:.4f}.pt"
             )
             torch.save(model.state_dict(), save_path)
-            log(f"✅ Saved best to: {save_path}")
+            log(f"Saved best to: {save_path}")
 
     log("Training finished.")
 
