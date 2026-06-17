@@ -8,6 +8,38 @@ This repository contains the training and evaluation scripts used for the RADx /
 
 The scripts are research scripts with hardcoded dataset and checkpoint paths from the original compute environment. Before running, update the path constants at the top of each script to match the local data and checkpoint locations.
 
+## Requirements
+
+The code was developed and run in a conda environment with Python 3.11.13 and CUDA-enabled PyTorch. The main Python dependencies are:
+
+- `torch`, `torchvision`
+- `transformers`, `timm`
+- `numpy`, `pandas`, `scipy`, `scikit-learn`, `Pillow`
+- `tqdm`
+- `torchmetrics`
+- `ultralytics`
+- `open_clip_torch` / `open_clip`
+- `opencv-python` and standard image-processing utilities as needed by the detection and segmentation scripts
+
+Several detection, segmentation, CLIP, and optimizer dependencies were imported from local source checkouts in the original environment rather than installed as standard site-packages. The relevant scripts append these local repositories to `sys.path`, for example:
+
+```text
+../../repo/yolov12/
+../../repo/thop/
+../../repo/detr/
+../../repo/torchmetrics/src/
+../../repo/utilities/src/
+../../repo/cocoapi/PythonAPI/
+```
+
+The pretraining script also exposes an optional Muon optimizer path. Muon is not required for the final reported model; if Muon is unavailable, the script falls back to Adam-based optimization.
+
+To save a minimal conda environment specification from the original environment, run:
+
+```bash
+conda env export --from-history > environment.yml
+```
+
 ## Repository Layout
 
 ```text
